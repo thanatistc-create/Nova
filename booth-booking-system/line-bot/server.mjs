@@ -4686,15 +4686,6 @@ async function handleFileMessage(event) {
 
   if (!isXlsx) return;
 
-  let xlsxMod;
-  try {
-    xlsxMod = await import("xlsx");
-  } catch {
-    console.warn("[file] xlsx module not available — skipping Excel cross-check");
-    return;
-  }
-  const XLSX = xlsxMod.default ?? xlsxMod;
-
   let buffer;
   try {
     buffer = await fetchLineMessageContent(messageId);
@@ -4721,6 +4712,14 @@ async function handleFileMessage(event) {
       .filter((r) => r.shopName && r.projectName);
   } else {
     // ── Fallback: local XLSX parsing ──────────────────────────────────────────
+    let xlsxMod;
+    try {
+      xlsxMod = await import("xlsx");
+    } catch {
+      console.warn("[file] xlsx module not available and Nova unavailable — cannot parse Excel");
+      return;
+    }
+    const XLSX = xlsxMod.default ?? xlsxMod;
     let workbook;
     try {
       workbook = XLSX.read(buffer, { type: "buffer" });
