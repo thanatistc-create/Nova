@@ -3866,6 +3866,47 @@ async function callTextParseWithGemini(text) {
   }
 }
 
+async function callNovaForExcel(buffer, fileName) {
+  if (!NOVA_ENABLED || !NOVA_BASE_URL) return null;
+  const boundary = `NovaBoundary${Date.now()}`;
+  const CRLF = "\r\n";
+  const secretPart = Buffer.from(
+    `--${boundary}${CRLF}Content-Disposition: form-data; name="secret"${CRLF}${CRLF}${NOVA_SECRET_KEY}`
+  );
+  const filePart = Buffer.from(
+    `${CRLF}--${boundary}${CRLF}` +
+    `Content-Disposition: form-data; name="file"; filename="${fileName.replace(/"/g, "_")}"${CRLF}` +
+    `Content-Type: application/octet-stream${CRLF}${CRLF}`
+  );
+  const closing = Buffer.from(`${CRLF}--${boundary}--${CRLF}`);
+  const body = Buffer.concat([secretPart, filePart, buffer, closing]);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 90_000);
+  try {
+    console.log(`[file] nova:excel:start file="${fileName}" bytes=${buffer.length}`);
+    const res = await fetch(`${NOVA_BASE_URL}/nova_process_excel`, {
+      method: "POST",
+      headers: {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": String(body.length),
+      },
+      body,
+      signal: controller.signal,
+    });
+    if (!res.ok) { console.warn(`[file] nova:excel HTTP ${res.status}`); return null; }
+    const json = await res.json();
+    if (json.status === "ok" && Array.isArray(json.rows)) {
+      console.log(`[file] nova:excel:done rows=${json.rows.length}`);
+      return json.rows;
+    }
+  } catch (err) {
+    console.warn("[file] nova:excel error:", err?.message ?? err);
+  } finally {
+    clearTimeout(timeout);
+  }
+  return null;
+}
+
 async function callAIForTextParse(text, lineEvent = null) {
   // Try Nova first if configured
   if (NOVA_ENABLED) {
@@ -4663,45 +4704,58 @@ async function handleFileMessage(event) {
   }
   if (!buffer) return;
 
-  let workbook;
-  try {
-    workbook = XLSX.read(buffer, { type: "buffer" });
-  } catch (err) {
-    console.warn("[file] XLSX.read error:", err?.message ?? err);
-    return;
-  }
-
-  // Collect booking rows from all sheets
   const groupId = getGroupIdFromSource(source);
-  const defaultProject = await getGroupDefaultProject(groupId);
 
-  // Pre-resolve projectName per sheet (fuzzy match sheet name → DB project)
-  const sheetProjectMap = {};
-  for (const sheetName of workbook.SheetNames) {
-    sheetProjectMap[sheetName] = await resolveProjectFromSheetName(sheetName, groupId, defaultProject);
-    console.log(`[file] xlsx:sheet="${sheetName}" → project="${sheetProjectMap[sheetName]}"`);
-  }
-
-  const excelRows = [];
-  let firstSheetLogged = false;
-  for (const sheetName of workbook.SheetNames) {
-    const sheet = workbook.Sheets[sheetName];
-    const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
-    if (!firstSheetLogged && rows.length > 0) {
-      console.log(`[file] xlsx:columns sheet="${sheetName}" cols=${JSON.stringify(Object.keys(rows[0]))}`);
-      console.log(`[file] xlsx:sample row[0]=${JSON.stringify(rows[0]).slice(0, 200)}`);
-      firstSheetLogged = true;
+  // ── Try Nova first for intelligent AI parsing ──────────────────────────────
+  const novaRows = await callNovaForExcel(buffer, fileName);
+  let excelRows;
+  if (novaRows) {
+    excelRows = novaRows
+      .map((r) => ({
+        boothCode: normalizeSpaces(String(r.boothCode ?? "")),
+        shopName: normalizeSpaces(String(r.shopName ?? "")),
+        projectName: normalizeSpaces(String(r.projectName ?? "")),
+        phone: normalizeSpaces(String(r.phone ?? "")),
+        note: normalizeSpaces(String(r.note ?? "")),
+      }))
+      .filter((r) => r.shopName && r.projectName);
+  } else {
+    // ── Fallback: local XLSX parsing ──────────────────────────────────────────
+    let workbook;
+    try {
+      workbook = XLSX.read(buffer, { type: "buffer" });
+    } catch (err) {
+      console.warn("[file] XLSX.read error:", err?.message ?? err);
+      return;
     }
-    for (const row of rows) {
-      const pick = (...keys) => normalizeSpaces(String(keys.map((k) => row[k] ?? "").find((v) => v !== "") ?? ""));
-      const boothCode = pick("booth_code", "บูธ", "เลขบูธ", "Booth", "BOOTH");
-      const shopName = pick("shop_name", "ชื่อร้าน", "ร้าน", "Shop", "SHOP");
-      const projectName = sheetProjectMap[sheetName] || defaultProject || "";
-      const phone = pick("phone", "เบอร์โทร", "เบอร์", "Phone");
-      const note = pick("note", "หมายเหตุ", "Note");
-      // Skip empty or summary rows (total, รวม, ผลรวม, สรุป, etc.)
-      const isSummaryRow = /^(total|รวม|ผลรวม|สรุป|summary|sub\s*total|grand\s*total|ทั้งหมด)$/i.test(shopName);
-      if (shopName && !isSummaryRow) excelRows.push({ boothCode, shopName, projectName, phone, note });
+
+    const defaultProject = await getGroupDefaultProject(groupId);
+    const sheetProjectMap = {};
+    for (const sheetName of workbook.SheetNames) {
+      sheetProjectMap[sheetName] = await resolveProjectFromSheetName(sheetName, groupId, defaultProject);
+      console.log(`[file] xlsx:sheet="${sheetName}" → project="${sheetProjectMap[sheetName]}"`);
+    }
+
+    excelRows = [];
+    let firstSheetLogged = false;
+    for (const sheetName of workbook.SheetNames) {
+      const sheet = workbook.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+      if (!firstSheetLogged && rows.length > 0) {
+        console.log(`[file] xlsx:columns sheet="${sheetName}" cols=${JSON.stringify(Object.keys(rows[0]))}`);
+        console.log(`[file] xlsx:sample row[0]=${JSON.stringify(rows[0]).slice(0, 200)}`);
+        firstSheetLogged = true;
+      }
+      for (const row of rows) {
+        const pick = (...keys) => normalizeSpaces(String(keys.map((k) => row[k] ?? "").find((v) => v !== "") ?? ""));
+        const boothCode = pick("booth_code", "บูธ", "เลขบูธ", "Booth", "BOOTH");
+        const shopName = pick("shop_name", "ชื่อร้าน", "ร้าน", "Shop", "SHOP");
+        const projectName = sheetProjectMap[sheetName] || defaultProject || "";
+        const phone = pick("phone", "เบอร์โทร", "เบอร์", "Phone");
+        const note = pick("note", "หมายเหตุ", "Note");
+        const isSummaryRow = /^(total|รวม|ผลรวม|สรุป|summary|sub\s*total|grand\s*total|ทั้งหมด)$/i.test(shopName);
+        if (shopName && !isSummaryRow) excelRows.push({ boothCode, shopName, projectName, phone, note });
+      }
     }
   }
 
