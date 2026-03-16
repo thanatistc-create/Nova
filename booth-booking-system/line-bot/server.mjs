@@ -703,14 +703,42 @@ async function upsertGroupDefaultProject(groupId, projectName) {
 function extractDatesFromText(text) {
   const dates = [];
   const raw = String(text ?? "");
-  // Match patterns: 29/04, 8/05, 29/4, 01/05/2026
-  const re = /(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/g;
-  let m;
-  while ((m = re.exec(raw)) !== null) {
-    const day = parseInt(m[1], 10);
-    const month = parseInt(m[2], 10);
-    if (day >= 1 && day <= 31 && month >= 1 && month <= 12) {
-      dates.push({ day, month });
+  // Thai month abbreviations → month number
+  const THAI_MONTHS = {
+    "ม.ค": 1, "มค": 1, "ก.พ": 2, "กพ": 2,
+    "มี.ค": 3, "มีค": 3, "เม.ย": 4, "เมย": 4,
+    "พ.ค": 5, "พค": 5, "มิ.ย": 6, "มิย": 6,
+    "ก.ค": 7, "กค": 7, "ส.ค": 8, "สค": 8,
+    "ก.ย": 9, "กย": 9, "ต.ค": 10, "ตค": 10,
+    "พ.ย": 11, "พย": 11, "ธ.ค": 12, "ธค": 12,
+  };
+  // Try "N-M thaimonth" or "N thaimonth" patterns first (e.g. "1-5 เม.ย", "8 ก.ย")
+  let foundThaiDates = false;
+  for (const [abbr, month] of Object.entries(THAI_MONTHS)) {
+    const esc = abbr.replace(/\./g, "\\.");
+    const reRange = new RegExp(`(\\d{1,2})\\s*[-–]\\s*(\\d{1,2})\\s*${esc}`, "g");
+    let m;
+    while ((m = reRange.exec(raw)) !== null) {
+      const d1 = parseInt(m[1], 10), d2 = parseInt(m[2], 10);
+      if (d1 >= 1 && d1 <= 31) { dates.push({ day: d1, month }); foundThaiDates = true; }
+      if (d2 >= 1 && d2 <= 31) { dates.push({ day: d2, month }); foundThaiDates = true; }
+    }
+    const reSingle = new RegExp(`(\\d{1,2})\\s*${esc}`, "g");
+    while ((m = reSingle.exec(raw)) !== null) {
+      const d = parseInt(m[1], 10);
+      if (d >= 1 && d <= 31) { dates.push({ day: d, month }); foundThaiDates = true; }
+    }
+  }
+  // Fallback: numeric patterns like 29/04, 8/05 (only when no Thai months found)
+  if (!foundThaiDates) {
+    const re = /(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/g;
+    let m;
+    while ((m = re.exec(raw)) !== null) {
+      const day = parseInt(m[1], 10);
+      const month = parseInt(m[2], 10);
+      if (day >= 1 && day <= 31 && month >= 1 && month <= 12) {
+        dates.push({ day, month });
+      }
     }
   }
   return dates;
@@ -4671,8 +4699,9 @@ async function handleFileMessage(event) {
       const projectName = sheetProjectMap[sheetName] || defaultProject || "";
       const phone = pick("phone", "เบอร์โทร", "เบอร์", "Phone");
       const note = pick("note", "หมายเหตุ", "Note");
-      // Only add rows with a valid shop name (skip totals/empty/summary rows)
-      if (shopName) excelRows.push({ boothCode, shopName, projectName, phone, note });
+      // Skip empty or summary rows (total, รวม, ผลรวม, สรุป, etc.)
+      const isSummaryRow = /^(total|รวม|ผลรวม|สรุป|summary|sub\s*total|grand\s*total|ทั้งหมด)$/i.test(shopName);
+      if (shopName && !isSummaryRow) excelRows.push({ boothCode, shopName, projectName, phone, note });
     }
   }
 
