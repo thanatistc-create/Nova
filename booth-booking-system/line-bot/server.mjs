@@ -555,40 +555,45 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems) {
 
   // AI-parsed review items (bookings only)
   const bookingReview = (reviewItems ?? []).filter((i) => i?.category === "booking");
-  const reviewSuffix = bookingReview.length
-    ? "\n\n⚠️ รอตรวจสอบ (" + bookingReview.length + " รายการ)\n" + bookingReview.slice(0, 10).map(formatImageDigestEventLine).join("\n")
-    : "";
 
-  // Try Nova generate summary (Python formatter — no AI hallucination)
-  if (NOVA_ENABLED && NOVA_BASE_URL) {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 10000);
-      const res = await fetch(`${NOVA_BASE_URL}/nova_generate_summary`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ secret: NOVA_SECRET_KEY, slot, projects: projectsData }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
-      if (res.ok) {
-        const json = await res.json();
-        if (json.status === "ok" && json.summaryText) {
-          console.log(`[digest] nova_generate_summary ok projects=${projectsData.length}`);
-          return (json.summaryText + reviewSuffix).slice(0, 4500);
-        }
+  // Build per-project messages: header first, then one message per project
+  // lines[0] = header, then each project section starts with a blank line separator
+  // Split into separate message strings for LINE (avoids 5000-char limit)
+  const headerLine = lines[0]; // "สรุปยอดจองพื้นที่ (อัปเดต: ...)"
+  const messages = [];
+
+  if (activeProjects.length === 0) {
+    messages.push(lines.join("\n").slice(0, 4500));
+  } else {
+    // lines layout: [header, "", project1..., "", project2..., ...]
+    // Split by the blank-line+projectName boundaries
+    const projectSections = [];
+    let current = [];
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (line === "" && i + 1 < lines.length) {
+        if (current.length) projectSections.push(current);
+        current = [];
+      } else {
+        current.push(line);
       }
-    } catch (e) {
-      console.error("[digest] nova_generate_summary failed:", e.message);
+    }
+    if (current.length) projectSections.push(current);
+
+    messages.push(headerLine);
+    for (const section of projectSections) {
+      messages.push(section.join("\n").slice(0, 4500));
     }
   }
 
-  // Fallback: local format
   if (bookingReview.length) {
-    lines.push("", `⚠️ รอตรวจสอบ (${bookingReview.length} รายการ)`);
-    for (const item of bookingReview.slice(0, 10)) lines.push(formatImageDigestEventLine(item));
+    const reviewLines = [`⚠️ รอตรวจสอบ (${bookingReview.length} รายการ)`];
+    for (const item of bookingReview.slice(0, 10)) reviewLines.push(formatImageDigestEventLine(item));
+    messages.push(reviewLines.join("\n").slice(0, 4500));
   }
-  return lines.join("\n").slice(0, 4500);
+
+  console.log(`[digest] nova_generate_summary ok projects=${projectsData.length}`);
+  return messages.filter(Boolean);
 }
 
 function listDueImageDigestSlots(now = new Date()) {
@@ -636,9 +641,14 @@ async function flushImageDigestSlot(slot) {
     items.sort((a, b) => String(a.occurredAt).localeCompare(String(b.occurredAt)));
     const groupId = items.find((i) => i?.groupId)?.groupId ?? target;
     const reviewItems = items.filter((i) => i?.status !== "saved");
-    const message = await buildBookingDigestMessage(slot, groupId, reviewItems);
-    if (!message) continue;
-    const ok = await pushMessage(target, [message]);
+    const messages = await buildBookingDigestMessage(slot, groupId, reviewItems);
+    if (!messages?.length) continue;
+    // Send up to 5 messages per LINE API call; split if more than 5
+    let ok = true;
+    for (let i = 0; i < messages.length; i += 5) {
+      ok = await pushMessage(target, messages.slice(i, i + 5)) && ok;
+    }
+    if (!ok) continue;
     if (!ok) continue;
     for (const item of items) {
       if (pendingIds.has(item.id)) sentIds.add(item.id);
@@ -1681,7 +1691,7 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
 
     if (priceError && !isMissingSalesSchemaError(priceError)) {
       console.error(priceError);
-      return { ok: false, message: "Failed to read booth price setting. Please try again." };
+      return { ok: false, message: "ไม่สามารถอ่านข้อมูลราคาบูธได้ กรุณาลองใหม่อีกครั้ง" };
     }
 
     effectiveBooking.boothPrice = price;
@@ -1696,7 +1706,7 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
 
     if (conflictError) {
       console.error(conflictError);
-      return { ok: false, message: "Failed to check duplicate booth. Please try again." };
+      return { ok: false, message: "ไม่สามารถตรวจสอบบูธซ้ำได้ กรุณาลองใหม่อีกครั้ง" };
     }
 
     if (conflict) {
@@ -1740,7 +1750,7 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
       const { error: cancelError } = await cancelRecordById(conflict.id, reason);
       if (cancelError) {
         console.error(cancelError);
-        return { ok: false, message: "Failed to replace booth because old booking could not be cancelled." };
+        return { ok: false, message: "ไม่สามารถแทนที่บูธได้ เนื่องจากยกเลิกการจองเดิมไม่สำเร็จ" };
       }
 
       replacedConflict = conflict;
@@ -1750,7 +1760,7 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
   const { data, error } = await insertBookingRecord(effectiveBooking, source, messageId);
   if (error) {
     console.error(error);
-    return { ok: false, message: "Failed to save booking. Please try again." };
+    return { ok: false, message: "บันทึกการจองไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" };
   }
 
   clearPendingReplacement(source);
@@ -1918,7 +1928,7 @@ async function saveExpenseWithProjectPrompt(parsed, source, messageId) {
     if (isMissingExpenseTableError(error)) {
       return { ok: false, message: EXPENSE_MIGRATION_HINT };
     }
-    return { ok: false, message: "Failed to save expense. Please try again." };
+    return { ok: false, message: "บันทึกค่าใช้จ่ายไม่สำเร็จ กรุณาลองใหม่อีกครั้ง" };
   }
 
   clearPendingExpense(source);
@@ -2614,7 +2624,7 @@ async function commandSalesSummary(text, source) {
   if (error) {
     console.error(error);
     if (isMissingSalesSchemaError(error)) return SALES_MIGRATION_HINT;
-    return "Failed to generate sales summary";
+    return "ไม่สามารถสร้างสรุปยอดขายได้";
   }
 
   const rows = data ?? [];
@@ -2883,7 +2893,7 @@ async function commandSummary(text, source) {
   const { data, error } = await query;
   if (error) {
     console.error(error);
-    return "Failed to generate summary";
+    return "ไม่สามารถสร้างสรุปได้";
   }
 
   const rows = data ?? [];
@@ -2968,7 +2978,7 @@ async function commandExpenseSummary(text, source) {
   if (error) {
     console.error(error);
     if (isMissingExpenseTableError(error)) return EXPENSE_MIGRATION_HINT;
-    return "Failed to generate expense summary";
+    return "ไม่สามารถสร้างสรุปค่าใช้จ่ายได้";
   }
 
   const rows = data ?? [];
@@ -3024,7 +3034,7 @@ async function commandExportExpenseCsv(text, source) {
   if (error) {
     console.error(error);
     if (isMissingExpenseTableError(error)) return EXPENSE_MIGRATION_HINT;
-    return "Failed to generate expense export link";
+    return "ไม่สามารถสร้างลิงก์ส่งออกค่าใช้จ่ายได้";
   }
 
   const url = buildExpenseExportUrl(groupId, dateStr, projectFilter);
@@ -3131,7 +3141,7 @@ async function commandCancel(text, source) {
   const { data, error } = await query;
   if (error) {
     console.error(error);
-    return "Failed to find booking record";
+    return "ไม่พบข้อมูลการจอง";
   }
 
   const candidates = data ?? [];
@@ -3178,7 +3188,7 @@ async function commandCancel(text, source) {
 
   if (updateError) {
     console.error(updateError);
-    return "Cancel booking failed";
+    return "ยกเลิกการจองไม่สำเร็จ";
   }
 
   clearPendingReplacement(source);
@@ -4003,7 +4013,7 @@ function buildExpenseFromAiAnalysis(analysis, ocrText = "") {
 async function commandBookingFromImage(event) {
   if (!LINE_OCR_ENABLED && !LINE_AI_IMAGE_FALLBACK_ENABLED) {
     return {
-      replyText: "Image reading is disabled. Please send booking or expense as text.",
+      replyText: "ปิดการอ่านรูปภาพ กรุณาส่งข้อมูลการจองหรือค่าใช้จ่ายเป็นข้อความ",
       digestEvent: buildImageDigestEvent(event, { category: "failure", status: "needs_review", reason: "image_reading_disabled" }),
     };
   }
@@ -4019,7 +4029,7 @@ async function commandBookingFromImage(event) {
   if (!imageBuffer) {
     console.log(`[image] pipeline:stop message=${messageId} reason=fetch_failed elapsed_ms=${elapsedMs(startedAt)}`);
     return {
-      replyText: "Cannot fetch image content. Please send booking or expense as text.",
+      replyText: "ไม่สามารถดึงข้อมูลรูปภาพได้ กรุณาส่งข้อมูลการจองหรือค่าใช้จ่ายเป็นข้อความ",
       digestEvent: buildImageDigestEvent(event, { category: "failure", status: "needs_review", reason: "fetch_failed" }),
     };
   }
@@ -4180,7 +4190,7 @@ async function commandBookingFromImage(event) {
   if (!ocrText && !LINE_AI_IMAGE_FALLBACK_ENABLED) {
     console.log(`[image] pipeline:stop message=${messageId} reason=ocr_failed elapsed_ms=${elapsedMs(startedAt)}`);
     return {
-      replyText: "OCR failed. Please send booking or expense details in text.",
+      replyText: "อ่านรูปภาพไม่สำเร็จ กรุณาส่งข้อมูลการจองหรือค่าใช้จ่ายเป็นข้อความ",
       digestEvent: buildImageDigestEvent(event, { category: "failure", status: "needs_review", reason: "ocr_failed" }),
     };
   }
@@ -4319,7 +4329,12 @@ async function handleTextMessage(event) {
   if (/^\/สรุป(?:\s|$)/.test(normalized) || /^\/report(?:\s|$)/i.test(normalized)) {
     const { dateStr, hour } = getTimePartsInTz(new Date());
     const groupId = getGroupIdFromSource(source);
-    return buildBookingDigestMessage({ dateStr, hour }, groupId, []);
+    const pushTarget = source.groupId ?? source.roomId ?? source.userId;
+    const msgs = await buildBookingDigestMessage({ dateStr, hour }, groupId, []);
+    if (msgs?.length) {
+      for (let i = 0; i < msgs.length; i += 5) await pushMessage(pushTarget, msgs.slice(i, i + 5));
+    }
+    return null;
   }
 
   if (normalized.startsWith(thaiBook) || /^\/book(?:\s|$)/i.test(normalized)) {
