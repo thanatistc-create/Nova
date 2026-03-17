@@ -416,11 +416,9 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems) {
     }
   }
 
-  // Build active project list: active pricing + orphaned bookings (not in pricing at all)
-  const activeKeySet = new Set([
-    ...pricingActiveKeys,
-    ...[...bookingCanonicalMap.keys()].filter((k) => !pricingKnownKeys.has(k)),
-  ]);
+  // Build active project list: only projects with future end_date in pricing
+  // (exclude orphaned bookings to prevent historical Excel imports from polluting digest)
+  const activeKeySet = new Set([...pricingActiveKeys]);
   // Resolve canonical display names: pricing wins over booking raw name
   const resolveCanonical = (key) => pricingMap.get(key)?.canonicalName ?? bookingCanonicalMap.get(key) ?? key;
   let activeProjects = [...activeKeySet].sort().map((key) => ({ key, name: resolveCanonical(key) }));
@@ -716,14 +714,14 @@ function extractDatesFromText(text) {
   let foundThaiDates = false;
   for (const [abbr, month] of Object.entries(THAI_MONTHS)) {
     const esc = abbr.replace(/\./g, "\\.");
-    const reRange = new RegExp(`(\\d{1,2})\\s*[-–]\\s*(\\d{1,2})\\s*${esc}`, "g");
+    const reRange = new RegExp(`(\\d{1,2})\\s*[-–]\\s*(\\d{1,2})[\\s.]*${esc}`, "g");
     let m;
     while ((m = reRange.exec(raw)) !== null) {
       const d1 = parseInt(m[1], 10), d2 = parseInt(m[2], 10);
       if (d1 >= 1 && d1 <= 31) { dates.push({ day: d1, month }); foundThaiDates = true; }
       if (d2 >= 1 && d2 <= 31) { dates.push({ day: d2, month }); foundThaiDates = true; }
     }
-    const reSingle = new RegExp(`(\\d{1,2})\\s*${esc}`, "g");
+    const reSingle = new RegExp(`(\\d{1,2})[\\s.]*${esc}`, "g");
     while ((m = reSingle.exec(raw)) !== null) {
       const d = parseInt(m[1], 10);
       if (d >= 1 && d <= 31) { dates.push({ day: d, month }); foundThaiDates = true; }
@@ -3866,12 +3864,15 @@ async function callTextParseWithGemini(text) {
   }
 }
 
-async function callNovaForExcel(buffer, fileName) {
+async function callNovaForExcel(buffer, fileName, projectNames = []) {
   if (!NOVA_ENABLED || !NOVA_BASE_URL) return null;
   const boundary = `NovaBoundary${Date.now()}`;
   const CRLF = "\r\n";
   const secretPart = Buffer.from(
     `--${boundary}${CRLF}Content-Disposition: form-data; name="secret"${CRLF}${CRLF}${NOVA_SECRET_KEY}`
+  );
+  const projectsPart = Buffer.from(
+    `${CRLF}--${boundary}${CRLF}Content-Disposition: form-data; name="project_names"${CRLF}${CRLF}${JSON.stringify(projectNames)}`
   );
   const filePart = Buffer.from(
     `${CRLF}--${boundary}${CRLF}` +
@@ -3879,9 +3880,9 @@ async function callNovaForExcel(buffer, fileName) {
     `Content-Type: application/octet-stream${CRLF}${CRLF}`
   );
   const closing = Buffer.from(`${CRLF}--${boundary}--${CRLF}`);
-  const body = Buffer.concat([secretPart, filePart, buffer, closing]);
+  const body = Buffer.concat([secretPart, projectsPart, filePart, buffer, closing]);
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 90_000);
+  const timeout = setTimeout(() => controller.abort(), 150_000);
   try {
     console.log(`[file] nova:excel:start file="${fileName}" bytes=${buffer.length}`);
     const res = await fetch(`${NOVA_BASE_URL}/nova_process_excel`, {
@@ -4697,8 +4698,20 @@ async function handleFileMessage(event) {
 
   const groupId = getGroupIdFromSource(source);
 
+  // Fetch known projects (with dates) for this group to help Nova match sheet → project
+  let knownProjects = [];
+  if (groupId) {
+    const { data: pData } = await supabase
+      .from("line_project_pricing")
+      .select("project_name, event_start_date, event_end_date")
+      .eq("group_id", groupId);
+    knownProjects = (pData ?? [])
+      .filter((p) => p.project_name)
+      .map((p) => ({ name: p.project_name, startDate: p.event_start_date, endDate: p.event_end_date }));
+  }
+
   // ── Try Nova first for intelligent AI parsing ──────────────────────────────
-  const novaRows = await callNovaForExcel(buffer, fileName);
+  const novaRows = await callNovaForExcel(buffer, fileName, knownProjects);
   let excelRows;
   if (novaRows) {
     excelRows = novaRows
@@ -4745,15 +4758,18 @@ async function handleFileMessage(event) {
         console.log(`[file] xlsx:sample row[0]=${JSON.stringify(rows[0]).slice(0, 200)}`);
         firstSheetLogged = true;
       }
+      let lastShopName = "";
       for (const row of rows) {
         const pick = (...keys) => normalizeSpaces(String(keys.map((k) => row[k] ?? "").find((v) => v !== "") ?? ""));
         const boothCode = pick("booth_code", "บูธ", "เลขบูธ", "Booth", "BOOTH");
-        const shopName = pick("shop_name", "ชื่อร้าน", "ร้าน", "Shop", "SHOP");
+        const rawShop = pick("shop_name", "ชื่อร้าน", "ร้าน", "Shop", "SHOP");
+        if (rawShop) lastShopName = rawShop;
+        const shopName = lastShopName;
         const projectName = sheetProjectMap[sheetName] || defaultProject || "";
         const phone = pick("phone", "เบอร์โทร", "เบอร์", "Phone");
         const note = pick("note", "หมายเหตุ", "Note");
         const isSummaryRow = /^(total|รวม|ผลรวม|สรุป|summary|sub\s*total|grand\s*total|ทั้งหมด)$/i.test(shopName);
-        if (shopName && !isSummaryRow) excelRows.push({ boothCode, shopName, projectName, phone, note });
+        if (boothCode && shopName && !isSummaryRow) excelRows.push({ boothCode, shopName, projectName, phone, note });
       }
     }
   }
