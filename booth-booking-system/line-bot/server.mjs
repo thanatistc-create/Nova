@@ -3505,16 +3505,20 @@ function buildImageAiAnalysisPrompt(ocrText) {
   return [
     "Classify this LINE image for a Thai booth booking bot.",
     "Return JSON only. Never invent missing facts. Use null for unknown fields.",
-    "classification must be exactly one of: booking, expense, create_event, unknown.",
+    "classification must be exactly one of: booking, expense, income_slip, create_event, unknown.",
     "",
     "RULE 1 — create_event: Use when the image is a FLOOR PLAN, BOOTH MAP, or EVENT POSTER showing an event name, event dates, and multiple numbered booth squares in a grid/layout. DO NOT classify a floor plan as booking.",
     "If create_event: fill event.projectName, event.startDate (YYYY-MM-DD), event.endDate (YYYY-MM-DD), event.totalBooths (count ALL numbered booth squares), event.venue, event.boothPrice.",
     "",
     "RULE 2 — booking: Use ONLY when image is a single shop booking FORM or CONFIRMATION with shopName + booth assignment. Must have shopName.",
     "",
-    "RULE 3 — expense: Use when image is a transfer slip, receipt, or payment proof with an amount.",
+    "RULE 3 — income_slip: Use when the image is a bank transfer slip where a CUSTOMER is paying for booth rental.",
+    "Signs: memo/note (บันทึกช่วยจำ) mentions booth (บูท/บูธ/พื้นที่/จอง), or sender is a person/shop name paying an organizer company.",
     "",
-    "RULE 4 — unknown: Use when none of the above apply.",
+    "RULE 4 — expense: Use when image is a payment slip or receipt where the ORGANIZER is paying a vendor/supplier/contractor.",
+    "Signs: the sender is the organizing company, or memo mentions vendor services (ค่าแรง/ค่าวัสดุ/ค่าจ้าง/ค่าขนส่ง).",
+    "",
+    "RULE 5 — unknown: Use when none of the above apply.",
     "",
     "OCR text:",
     ocrPreview,
@@ -3530,7 +3534,7 @@ const IMAGE_AI_ANALYSIS_SCHEMA = {
   properties: {
     classification: {
       type: "string",
-      enum: ["booking", "expense", "create_event", "unknown"],
+      enum: ["booking", "expense", "income_slip", "create_event", "unknown"],
     },
     confidence: {
       type: ["number", "null"],
@@ -3838,7 +3842,7 @@ function adaptNovaResponse(data) {
       },
     };
   }
-  if (["cancellation", "tax_invoice", "general_chat"].includes(type)) {
+  if (["cancellation", "tax_invoice", "general_chat", "income_slip"].includes(type)) {
     return { classification: type, confidence: null, summary: data.replyText ?? null };
   }
   return { classification: "unknown", confidence: null, summary: data.replyText ?? null };
@@ -4189,12 +4193,6 @@ async function commandBookingFromImage(event) {
     }
   }
 
-  // Bank transfer slip = customer paying for booth = revenue, not expense → be silent
-  if (ocrText && looksLikePaymentSlip(ocrText)) {
-    console.log(`[image] pipeline:payment_slip:silent message=${messageId} elapsed_ms=${elapsedMs(startedAt)}`);
-    return null;
-  }
-
   if (ocrText && looksLikeExpenseText(ocrText) && expenseAllowed) {
     console.log(`[image] pipeline:ocr-expense message=${messageId} elapsed_ms=${elapsedMs(startedAt)}`);
     const parsed = parseExpenseCommand(ocrText);
@@ -4214,12 +4212,6 @@ async function commandBookingFromImage(event) {
   }
 
   const aiAnalysis = await analyzeImageWithAi(imageBuffer, ocrText, event);
-
-  // If AI sees a payment slip (expense classification but slip pattern) → silent
-  if (inferAiClassification(aiAnalysis, ocrText) === "expense" && looksLikePaymentSlip(ocrText || "")) {
-    console.log(`[image] pipeline:payment_slip:silent(ai) message=${messageId} elapsed_ms=${elapsedMs(startedAt)}`);
-    return null;
-  }
 
   // Handle create_event action — from Nova (_raw.structuredData.event) or Gemini (analysis.event)
   const isCreateEvent = aiAnalysis?.action === "create_event" || inferAiClassification(aiAnalysis, ocrText) === "create_event";
@@ -4255,8 +4247,8 @@ async function commandBookingFromImage(event) {
   console.log(`[image] pipeline:ai-classification message=${messageId} classification=${classification} elapsed_ms=${elapsedMs(startedAt)}`);
 
   // Silent for non-actionable images
-  if (["cancellation", "tax_invoice", "general_chat"].includes(classification) ||
-      ["cancellation", "tax_invoice", "general_chat"].includes(aiAnalysis?.classification)) {
+  if (["cancellation", "tax_invoice", "general_chat", "income_slip"].includes(classification) ||
+      ["cancellation", "tax_invoice", "general_chat", "income_slip"].includes(aiAnalysis?.classification)) {
     console.log(`[image] pipeline:silent message=${messageId} reason=${classification}`);
     return null;
   }
@@ -4620,9 +4612,6 @@ async function handleTextMessage(event) {
       if (bookingResponse) return bookingResponse;
     }
   }
-
-  // Payment slip text (copy-pasted or forwarded) = revenue, not expense → silent
-  if (looksLikePaymentSlip(rawText)) return null;
 
   if (looksLikeExpenseText(rawText)) {
     const expParsed = parseExpenseCommand(rawText);
