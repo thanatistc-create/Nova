@@ -358,7 +358,7 @@ function formatImageDigestEventLine(item) {
   return `- review | ${parts.join(" | ")}`;
 }
 
-async function buildBookingDigestMessage(slot, groupId, reviewItems) {
+async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilter = "") {
   const todayStr = slot.dateStr;
   const todayRange = getDailyRangeUtc(todayStr);
 
@@ -424,6 +424,10 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems) {
   let activeProjects = [...activeKeySet].sort().map((key) => ({ key, name: resolveCanonical(key) }));
   if (!activeProjects.length && groupId) {
     activeProjects = [...pricingActiveKeys].sort().map((key) => ({ key, name: resolveCanonical(key) }));
+  }
+  if (projectFilter) {
+    const f = projectFilter.toLowerCase().trim();
+    activeProjects = activeProjects.filter((p) => p.key.includes(f) || p.name.toLowerCase().includes(f));
   }
 
   const lines = [`สรุปยอดจองพื้นที่ (อัปเดต: ${todayStr} ${String(slot.hour).padStart(2, "0")}:00)`];
@@ -582,7 +586,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems) {
 
     messages.push(headerLine);
     for (const section of projectSections) {
-      messages.push(section.join("\n").slice(0, 4500));
+      messages.push(section.join("\n").slice(0, 4990));
     }
   }
 
@@ -774,8 +778,23 @@ function tokenize(text) {
     .filter((t) => t.length >= 2);
 }
 
+// Thai keyword → English alias for sheet-to-project matching
+const SHEET_ALIASES = [
+  { thai: "\u0e40\u0e21\u0e01\u0e01\u0e30", en: "mega" },
+  { thai: "\u0e01\u0e32\u0e41\u0e1f", en: "coffee" },
+  { thai: "\u0e44\u0e2d\u0e04\u0e2d\u0e19", en: "iconsiam" },
+  { thai: "\u0e1e\u0e32\u0e23\u0e32\u0e01\u0e2d\u0e19", en: "paragon" },
+  { thai: "\u0e2a\u0e22\u0e32\u0e21", en: "siam" },
+  { thai: "\u0e1b\u0e34\u0e48\u0e19\u0e40\u0e01\u0e25\u0e49\u0e32", en: "pinklao" },
+  { thai: "\u0e40\u0e0b\u0e47\u0e19\u0e17\u0e23\u0e31\u0e25", en: "central" },
+];
 function scoreSheetVsProject(sheetName, proj) {
-  const sheetTokens = tokenize(sheetName);
+  // Expand Thai aliases in sheet name before tokenizing
+  let expandedSheet = sheetName.toLowerCase();
+  for (const alias of SHEET_ALIASES) {
+    if (expandedSheet.includes(alias.thai)) expandedSheet += " " + alias.en;
+  }
+  const sheetTokens = tokenize(expandedSheet);
   const projTokens = tokenize(proj.project_name ?? "");
   if (!sheetTokens.length || !projTokens.length) return 0;
   const matches = projTokens.filter((pt) =>
@@ -897,7 +916,9 @@ function normalizeKey(value) {
 }
 
 function normalizeBoothCode(value) {
-  return normalizeSpaces(value).replace(/\s+/g, "").toUpperCase();
+  // Strip trailing ".0" from float-stored booth codes (e.g. "2.0" → "2")
+  const s = normalizeSpaces(String(value ?? "")).replace(/^(\d+)\.0+$/, "$1");
+  return s.replace(/\s+/g, "").toUpperCase();
 }
 
 function stripListPrefix(value) {
@@ -4010,6 +4031,28 @@ function buildExpenseFromAiAnalysis(analysis, ocrText = "") {
   };
 }
 
+async function callNovaFloorPlan(imageBuffer) {
+  if (!NOVA_ENABLED || !NOVA_BASE_URL) return null;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    const res = await fetch(`${NOVA_BASE_URL}/nova_read_floor_plan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Nova-Secret": NOVA_SECRET_KEY },
+      body: JSON.stringify({ image: imageBuffer.toString("base64") }),
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (json.is_floor_plan) return json;
+    return null;
+  } catch (e) {
+    console.warn("[image] nova:floor_plan:error", e?.message ?? e);
+    return null;
+  }
+}
+
 async function commandBookingFromImage(event) {
   if (!LINE_OCR_ENABLED && !LINE_AI_IMAGE_FALLBACK_ENABLED) {
     return {
@@ -4032,6 +4075,35 @@ async function commandBookingFromImage(event) {
       replyText: "ไม่สามารถดึงข้อมูลรูปภาพได้ กรุณาส่งข้อมูลการจองหรือค่าใช้จ่ายเป็นข้อความ",
       digestEvent: buildImageDigestEvent(event, { category: "failure", status: "needs_review", reason: "fetch_failed" }),
     };
+  }
+
+  // Try floor plan detection first
+  if (NOVA_ENABLED) {
+    const floorPlan = await callNovaFloorPlan(imageBuffer);
+    if (floorPlan) {
+      console.log(`[image] floor_plan:detected booths=${floorPlan.total_booths} project=${floorPlan.project_name}`);
+      const target = source?.groupId ?? source?.roomId ?? source?.userId;
+      // Save to line_project_pricing if we have useful data
+      if (floorPlan.total_booths || floorPlan.project_name) {
+        const projectName = floorPlan.project_name ?? await getGroupDefaultProject(groupId);
+        if (projectName) {
+          const upsertData = { group_id: groupId || "direct", project_name: projectName };
+          if (floorPlan.total_booths) upsertData.total_booths = floorPlan.total_booths;
+          if (floorPlan.start_date) upsertData.event_start_date = floorPlan.start_date;
+          if (floorPlan.end_date) upsertData.event_end_date = floorPlan.end_date;
+          await supabase.from("line_project_pricing").upsert(upsertData, { onConflict: "group_id,project_name" });
+        }
+        const lines = ["📐 ตรวจพบแปลนงาน!"];
+        if (floorPlan.project_name) lines.push(`📋 โปรเจกต์: ${floorPlan.project_name}`);
+        if (floorPlan.total_booths) lines.push(`🏪 จำนวนบูธทั้งหมด: ${floorPlan.total_booths} บูธ`);
+        if (floorPlan.start_date) lines.push(`📅 เริ่มงาน: ${floorPlan.start_date}`);
+        if (floorPlan.end_date) lines.push(`📅 จบงาน: ${floorPlan.end_date}`);
+        if (floorPlan.notes) lines.push(`📝 ${floorPlan.notes}`);
+        lines.push("✅ บันทึกข้อมูลแล้ว");
+        await pushMessage(target, [lines.join("\n")]);
+        return null;
+      }
+    }
   }
 
   const ocrText = LINE_OCR_ENABLED ? await recognizeTextFromImage(imageBuffer, { messageId }) : "";
@@ -4330,9 +4402,12 @@ async function handleTextMessage(event) {
     const { dateStr, hour } = getTimePartsInTz(new Date());
     const groupId = getGroupIdFromSource(source);
     const pushTarget = source.groupId ?? source.roomId ?? source.userId;
-    const msgs = await buildBookingDigestMessage({ dateStr, hour }, groupId, []);
+    const projectFilter = normalized.replace(/^\/สรุป\s*/i, "").replace(/^\/report\s*/i, "").trim();
+    const msgs = await buildBookingDigestMessage({ dateStr, hour }, groupId, [], projectFilter);
     if (msgs?.length) {
       for (let i = 0; i < msgs.length; i += 5) await pushMessage(pushTarget, msgs.slice(i, i + 5));
+    } else {
+      await pushMessage(pushTarget, [`ไม่พบโปรเจกต์ "${projectFilter}"`]);
     }
     return null;
   }
