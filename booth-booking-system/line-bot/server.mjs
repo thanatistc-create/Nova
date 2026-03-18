@@ -391,7 +391,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
     const { data } = await supabase
       .from("line_project_pricing")
       .select("project_name, event_start_date, event_end_date, total_booths")
-      .eq("group_id", groupId);
+      .or(`group_id.eq.${groupId},group_id.eq.direct`);
     for (const row of data ?? []) {
       if (!row.project_name) continue;
       const key = row.project_name.toLowerCase().trim();
@@ -413,7 +413,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
     const { data } = await supabase
       .from("line_booking_records")
       .select("project_name")
-      .eq("group_id", groupId)
+      .or(`group_id.eq.${groupId},group_id.eq.direct`)
       .eq("booking_status", "booked")
       .not("project_name", "is", null);
     for (const row of data ?? []) {
@@ -4158,7 +4158,6 @@ async function commandBookingFromImage(event) {
         if (floorPlan.total_booths) lines.push(`🏪 จำนวนบูธทั้งหมด: ${floorPlan.total_booths} บูธ`);
         if (floorPlan.start_date) lines.push(`📅 เริ่มงาน: ${floorPlan.start_date}`);
         if (floorPlan.end_date) lines.push(`📅 จบงาน: ${floorPlan.end_date}`);
-        if (floorPlan.notes) lines.push(`📝 ${floorPlan.notes}`);
         lines.push("✅ บันทึกข้อมูลแล้ว");
         await pushMessage(target, [lines.join("\n")]);
         return null;
