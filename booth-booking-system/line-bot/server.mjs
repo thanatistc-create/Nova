@@ -4315,7 +4315,7 @@ async function commandBookingFromImage(event) {
   };
 }
 const FLOWACCOUNT_URL_REGEX =
-  /https?:\/\/(?:app\.)?flowaccount\.com\/(?:share|invoice|document)\/[A-Za-z0-9_\-]+/i;
+  /https?:\/\/(?:[a-z0-9\-]+\.)*flowaccount\.com\/[^\s]*/i;
 
 async function parseFlowaccountHtml(html) {
   try {
@@ -4579,8 +4579,12 @@ async function handleTextMessage(event) {
   }
 
   if (!normalized.startsWith("/")) {
-    const bookingResponse = await tryAutoBookingText(rawText, source, event.message?.id, event);
-    if (bookingResponse) return bookingResponse;
+    // Skip booking detection if text is a billing note / invoice reference
+    const isInvoiceRef = /ใบแจ้งหนี้|ใบกำกับภาษี|ใบเสร็จรับเงิน|billing\s*note|tax\s*invoice/i.test(rawText);
+    if (!isInvoiceRef) {
+      const bookingResponse = await tryAutoBookingText(rawText, source, event.message?.id, event);
+      if (bookingResponse) return bookingResponse;
+    }
   }
 
   if (looksLikeExpenseText(rawText)) {
