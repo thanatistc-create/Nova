@@ -4121,11 +4121,22 @@ async function commandBookingFromImage(event) {
       if (floorPlan.total_booths || floorPlan.project_name) {
         const projectName = floorPlan.project_name ?? await getGroupDefaultProject(groupId);
         if (projectName) {
+          // Check if this project already has total_booths recorded (avoid duplicate notification)
+          const { data: existing } = await supabase
+            .from("line_project_pricing")
+            .select("total_booths")
+            .eq("group_id", groupId || "direct")
+            .ilike("project_name", projectName.replace(/%/g, "\\%"))
+            .maybeSingle();
+          const alreadyRecorded = existing?.total_booths != null;
+
           const upsertData = { group_id: groupId || "direct", project_name: projectName };
           if (floorPlan.total_booths) upsertData.total_booths = floorPlan.total_booths;
           if (floorPlan.start_date) upsertData.event_start_date = floorPlan.start_date;
           if (floorPlan.end_date) upsertData.event_end_date = floorPlan.end_date;
           await supabase.from("line_project_pricing").upsert(upsertData, { onConflict: "group_id,project_name" });
+
+          if (alreadyRecorded) return null; // already saved before — silent
         }
         const lines = ["📐 ตรวจพบแปลนงาน!"];
         if (floorPlan.project_name) lines.push(`📋 โปรเจกต์: ${floorPlan.project_name}`);
