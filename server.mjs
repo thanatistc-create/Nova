@@ -383,7 +383,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
     const { data } = await supabase
       .from("line_project_pricing")
       .select("project_name, event_start_date, event_end_date, total_booths")
-      .eq("group_id", groupId);
+      .or(`group_id.eq.${groupId},group_id.eq.direct`);
     for (const row of data ?? []) {
       if (!row.project_name) continue;
       const key = row.project_name.toLowerCase().trim();
@@ -405,7 +405,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
     const { data } = await supabase
       .from("line_booking_records")
       .select("project_name")
-      .eq("group_id", groupId)
+      .or(`group_id.eq.${groupId},group_id.eq.direct`)
       .eq("booking_status", "booked")
       .not("project_name", "is", null);
     for (const row of data ?? []) {
@@ -455,7 +455,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
       const { data } = await supabase
         .from("line_booking_records")
         .select("booth_code, shop_name, project_name")
-        .eq("group_id", groupId)
+        .or(`group_id.eq.${groupId},group_id.eq.direct`)
         .eq("booking_status", "booked")
         .ilike("project_name", projectKey.replace(/%/g, "\\%"))
         .gte("booked_at", todayRange.startIso)
@@ -470,7 +470,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
       const { data } = await supabase
         .from("line_booking_records")
         .select("booth_code, shop_name, table_free_qty, table_extra_qty, chair_free_qty, chair_extra_qty, power_amp, power_label, project_name")
-        .eq("group_id", groupId)
+        .or(`group_id.eq.${groupId},group_id.eq.direct`)
         .eq("booking_status", "booked")
         .ilike("project_name", projectKey.replace(/%/g, "\\%"))
         .order("booth_code", { ascending: true });
@@ -4694,6 +4694,11 @@ async function handlePdfMessage(event) {
   }
 }
 
+function powerPriceToLabel(price) {
+  const p = Number(price) || 0;
+  const map = { 0: "5A (ฟรี)", 500: "5A 24ชม", 700: "10-15A", 1000: "20-30A", 1200: "10-15A 24ชม", 1500: "⚠️ ตรวจสอบ (30A 3เฟส หรือ 20-30A 24ชม)", 2000: "30A 3เฟส 24ชม" };
+  return map[p] ?? (p > 0 ? String(p) + " บ." : "-");
+}
 async function handleFileMessage(event) {
   const source = event.source;
   const messageId = event.message?.id;
@@ -4737,13 +4742,22 @@ async function handleFileMessage(event) {
   let excelRows;
   if (novaRows) {
     excelRows = novaRows
-      .map((r) => ({
-        boothCode: normalizeSpaces(String(r.boothCode ?? "")).replace(/^(\d+)\.0+$/, "$1"),
-        shopName: normalizeSpaces(String(r.shopName ?? "")),
-        projectName: normalizeSpaces(String(r.projectName ?? "")),
-        phone: normalizeSpaces(String(r.phone ?? "")),
-        note: normalizeSpaces(String(r.note ?? "")),
-      }))
+      .map((r) => {
+        const tcPrice = Number(r.tableChairPrice) || 0;
+        const tableFreeQty = Math.floor(tcPrice / 350);
+        const chairFreeQty = Math.floor((tcPrice % 350) / 80);
+        const pwLabel = powerPriceToLabel(Number(r.powerPrice) || 0);
+        return {
+          boothCode: normalizeSpaces(String(r.boothCode ?? "")).replace(/^(\d+)\.0+$/, "$1"),
+          shopName: normalizeSpaces(String(r.shopName ?? "")),
+          projectName: normalizeSpaces(String(r.projectName ?? "")),
+          phone: normalizeSpaces(String(r.phone ?? "")),
+          note: normalizeSpaces(String(r.note ?? "")),
+          tableFreeQty,
+          chairFreeQty,
+          powerLabel: pwLabel !== "-" ? pwLabel : "",
+        };
+      })
       .filter((r) => r.shopName && r.projectName);
   } else {
     // ── Fallback: local XLSX parsing ──────────────────────────────────────────
@@ -4807,9 +4821,16 @@ async function handleFileMessage(event) {
   let saved = 0, duplicates = 0, errors = 0;
   for (const row of excelRows) {
     if (!row.projectName) { errors++; continue; }
-    const result = await saveBookingWithAgentRules(row, source, messageId, { allowPastEvents: true });
+    const result = await saveBookingWithAgentRules(row, source, messageId, { allowPastEvents: true, forceReplace: true });
     if (result.ok) saved++;
-    else if (result.needsConfirmation) duplicates++;
+    else if (result.needsConfirmation) {
+      duplicates++;
+      if (row.tableFreeQty || row.chairFreeQty || row.powerLabel) {
+        await supabase.from("line_booking_records")
+          .update({ table_free_qty: row.tableFreeQty ?? 0, chair_free_qty: row.chairFreeQty ?? 0, power_label: row.powerLabel || null })
+          .eq("project_name", row.projectName).eq("booth_code", row.boothCode).eq("booking_status", "booked");
+      }
+    }
     else errors++;
   }
 
