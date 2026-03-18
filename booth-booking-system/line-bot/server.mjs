@@ -1301,7 +1301,7 @@ function looksLikePaymentSlip(text) {
 function looksLikeExpenseText(text) {
   const raw = String(text ?? "");
   if (!raw.trim()) return false;
-  if (looksLikePaymentSlip(raw)) return true; // bank slip → treat as expense
+  if (looksLikePaymentSlip(raw)) return false; // bank slip = revenue, not expense
   if (looksLikeBookingText(raw)) return false;
 
   const hasExpenseHint =
@@ -4189,21 +4189,15 @@ async function commandBookingFromImage(event) {
     }
   }
 
+  // Bank transfer slip = customer paying for booth = revenue, not expense → be silent
+  if (ocrText && looksLikePaymentSlip(ocrText)) {
+    console.log(`[image] pipeline:payment_slip:silent message=${messageId} elapsed_ms=${elapsedMs(startedAt)}`);
+    return null;
+  }
+
   if (ocrText && looksLikeExpenseText(ocrText) && expenseAllowed) {
     console.log(`[image] pipeline:ocr-expense message=${messageId} elapsed_ms=${elapsedMs(startedAt)}`);
     const parsed = parseExpenseCommand(ocrText);
-    // For payment slips: extract payer/note from "บันทึกช่วยจำ:" line
-    if (looksLikePaymentSlip(ocrText)) {
-      const memoMatch = ocrText.match(/บันทึกช่วยจำ\s*[:：]?\s*(.+)/i);
-      const memo = memoMatch ? normalizeSpaces(memoMatch[1]) : "";
-      if (memo && !parsed.note) parsed.note = memo;
-      // Extract payer name (line after "จาก" or first name line before bank name)
-      if (!parsed.vendorName) {
-        const payerMatch = ocrText.match(/(?:^|\n)\s*(นาย|นาง(?:สาว)?|บจก\.|บมจ\.|ห้างหุ้นส่วน|คุณ)\s*([^\n]{2,40})/i);
-        if (payerMatch) parsed.vendorName = normalizeSpaces(`${payerMatch[1]}${payerMatch[2]}`).slice(0, 80);
-      }
-      parsed.expenseType = parsed.expenseType || "payment_slip";
-    }
     parsed.note = normalizeSpaces(`image_ocr${parsed.note ? ` | ${parsed.note}` : ""}`).slice(0, 1800);
     const result = await saveExpenseWithProjectPrompt(parsed, source, messageId);
     if (!result.ok) {
@@ -4220,6 +4214,12 @@ async function commandBookingFromImage(event) {
   }
 
   const aiAnalysis = await analyzeImageWithAi(imageBuffer, ocrText, event);
+
+  // If AI sees a payment slip (expense classification but slip pattern) → silent
+  if (inferAiClassification(aiAnalysis, ocrText) === "expense" && looksLikePaymentSlip(ocrText || "")) {
+    console.log(`[image] pipeline:payment_slip:silent(ai) message=${messageId} elapsed_ms=${elapsedMs(startedAt)}`);
+    return null;
+  }
 
   // Handle create_event action — from Nova (_raw.structuredData.event) or Gemini (analysis.event)
   const isCreateEvent = aiAnalysis?.action === "create_event" || inferAiClassification(aiAnalysis, ocrText) === "create_event";
@@ -4620,6 +4620,9 @@ async function handleTextMessage(event) {
       if (bookingResponse) return bookingResponse;
     }
   }
+
+  // Payment slip text (copy-pasted or forwarded) = revenue, not expense → silent
+  if (looksLikePaymentSlip(rawText)) return null;
 
   if (looksLikeExpenseText(rawText)) {
     const expParsed = parseExpenseCommand(rawText);
