@@ -304,9 +304,13 @@ function queueImageDigestEvent(eventPayload) {
     ...eventPayload,
   });
   // Remember this target so scheduled digest can reach it even on quiet days
+  // Exclude expense groups — they should not receive booking digest
   if (eventPayload.pushTarget) {
-    state.knownTargets = state.knownTargets ?? {};
-    state.knownTargets[eventPayload.pushTarget] = eventPayload.groupId ?? eventPayload.pushTarget;
+    const gid = eventPayload.groupId ?? eventPayload.pushTarget;
+    if (!LINE_EXPENSE_GROUP_IDS.includes(gid)) {
+      state.knownTargets = state.knownTargets ?? {};
+      state.knownTargets[eventPayload.pushTarget] = gid;
+    }
   }
   writeImageDigestState(state);
 }
@@ -639,9 +643,13 @@ async function flushImageDigestSlot(slot) {
   }
 
   // Keep knownTargets up-to-date from ALL historical events (not just today's)
+  // Exclude expense groups — they should not receive booking digest
   state.knownTargets = state.knownTargets ?? {};
   for (const item of (state.events ?? [])) {
-    if (item?.pushTarget) state.knownTargets[item.pushTarget] = item.groupId ?? item.pushTarget;
+    const gid = item?.groupId ?? item?.pushTarget;
+    if (item?.pushTarget && !LINE_EXPENSE_GROUP_IDS.includes(gid)) {
+      state.knownTargets[item.pushTarget] = gid;
+    }
   }
 
   // If no image events today, still send booking digest to all known targets
