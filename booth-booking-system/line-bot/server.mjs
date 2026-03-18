@@ -251,15 +251,16 @@ function shouldSuppressImmediateImageReply(event) {
 
 function readImageDigestState() {
   try {
-    if (!fs.existsSync(IMAGE_DIGEST_STATE_FILE)) return { events: [], sentSlots: {} };
+    if (!fs.existsSync(IMAGE_DIGEST_STATE_FILE)) return { events: [], sentSlots: {}, knownTargets: {} };
     const parsed = JSON.parse(fs.readFileSync(IMAGE_DIGEST_STATE_FILE, "utf8"));
     return {
       events: Array.isArray(parsed?.events) ? parsed.events : [],
       sentSlots: parsed?.sentSlots && typeof parsed.sentSlots === "object" ? parsed.sentSlots : {},
+      knownTargets: parsed?.knownTargets && typeof parsed.knownTargets === "object" ? parsed.knownTargets : {},
     };
   } catch (error) {
     console.error("Failed to read image digest state:", error);
-    return { events: [], sentSlots: {} };
+    return { events: [], sentSlots: {}, knownTargets: {} };
   }
 }
 
@@ -277,7 +278,9 @@ function pruneImageDigestState(state) {
     const timestamp = Date.parse(value ?? "");
     if (Number.isFinite(timestamp) && timestamp >= slotCutoff) sentSlots[key] = value;
   }
-  return { events, sentSlots };
+  // knownTargets persists indefinitely (no pruning)
+  const knownTargets = state?.knownTargets && typeof state.knownTargets === "object" ? state.knownTargets : {};
+  return { events, sentSlots, knownTargets };
 }
 
 function writeImageDigestState(state) {
@@ -300,6 +303,11 @@ function queueImageDigestEvent(eventPayload) {
     occurredAt: new Date().toISOString(),
     ...eventPayload,
   });
+  // Remember this target so scheduled digest can reach it even on quiet days
+  if (eventPayload.pushTarget) {
+    state.knownTargets = state.knownTargets ?? {};
+    state.knownTargets[eventPayload.pushTarget] = eventPayload.groupId ?? eventPayload.pushTarget;
+  }
   writeImageDigestState(state);
 }
 
@@ -630,7 +638,30 @@ async function flushImageDigestSlot(slot) {
     grouped.set(item.pushTarget, list);
   }
 
+  // Keep knownTargets up-to-date from ALL historical events (not just today's)
+  state.knownTargets = state.knownTargets ?? {};
+  for (const item of (state.events ?? [])) {
+    if (item?.pushTarget) state.knownTargets[item.pushTarget] = item.groupId ?? item.pushTarget;
+  }
+
+  // If no image events today, still send booking digest to all known targets
   if (!grouped.size) {
+    const knownTargets = state.knownTargets ?? {};
+    if (!Object.keys(knownTargets).length) {
+      state.sentSlots[slot.slotKey] = new Date().toISOString();
+      writeImageDigestState(state);
+      return;
+    }
+    let anyOk = false;
+    for (const [target, groupId] of Object.entries(knownTargets)) {
+      const messages = await buildBookingDigestMessage(slot, groupId, []);
+      if (!messages?.length) continue;
+      let ok = true;
+      for (let i = 0; i < messages.length; i += 5) {
+        ok = await pushMessage(target, messages.slice(i, i + 5)) && ok;
+      }
+      if (ok) anyOk = true;
+    }
     state.sentSlots[slot.slotKey] = new Date().toISOString();
     writeImageDigestState(state);
     return;
