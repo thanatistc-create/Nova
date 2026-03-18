@@ -1288,9 +1288,20 @@ function extractAmountFromText(text) {
   return null;
 }
 
+function looksLikePaymentSlip(text) {
+  const raw = String(text ?? "");
+  // Bank transfer slip patterns (KBank, SCB, Krungsri, etc.)
+  const hasSlipHeader = /โอนเงินสำเร็จ|transfer\s*success|รายการสำเร็จ|payment\s*success/i.test(raw);
+  const hasBankRef = /เลขที่รายการ|transaction\s*(id|no)|ref\.?\s*no/i.test(raw);
+  const hasBankName = /กสิกรไทย|กรุงไทย|กรุงเทพ|กรุงศรี|ไทยพาณิชย์|ออมสิน|kbank|ktb|scb|bbl|bay|ttb|uob/i.test(raw);
+  const hasAmount = /จำนวน\s*[\d,]+|[\d,]+\.?\d*\s*บาท/i.test(raw);
+  return (hasSlipHeader || hasBankRef) && hasBankName && hasAmount;
+}
+
 function looksLikeExpenseText(text) {
   const raw = String(text ?? "");
   if (!raw.trim()) return false;
+  if (looksLikePaymentSlip(raw)) return true; // bank slip → treat as expense
   if (looksLikeBookingText(raw)) return false;
 
   const hasExpenseHint =
@@ -4181,6 +4192,18 @@ async function commandBookingFromImage(event) {
   if (ocrText && looksLikeExpenseText(ocrText) && expenseAllowed) {
     console.log(`[image] pipeline:ocr-expense message=${messageId} elapsed_ms=${elapsedMs(startedAt)}`);
     const parsed = parseExpenseCommand(ocrText);
+    // For payment slips: extract payer/note from "บันทึกช่วยจำ:" line
+    if (looksLikePaymentSlip(ocrText)) {
+      const memoMatch = ocrText.match(/บันทึกช่วยจำ\s*[:：]?\s*(.+)/i);
+      const memo = memoMatch ? normalizeSpaces(memoMatch[1]) : "";
+      if (memo && !parsed.note) parsed.note = memo;
+      // Extract payer name (line after "จาก" or first name line before bank name)
+      if (!parsed.vendorName) {
+        const payerMatch = ocrText.match(/(?:^|\n)\s*(นาย|นาง(?:สาว)?|บจก\.|บมจ\.|ห้างหุ้นส่วน|คุณ)\s*([^\n]{2,40})/i);
+        if (payerMatch) parsed.vendorName = normalizeSpaces(`${payerMatch[1]}${payerMatch[2]}`).slice(0, 80);
+      }
+      parsed.expenseType = parsed.expenseType || "payment_slip";
+    }
     parsed.note = normalizeSpaces(`image_ocr${parsed.note ? ` | ${parsed.note}` : ""}`).slice(0, 1800);
     const result = await saveExpenseWithProjectPrompt(parsed, source, messageId);
     if (!result.ok) {
