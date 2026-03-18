@@ -3796,6 +3796,9 @@ function adaptNovaResponse(data) {
       },
     };
   }
+  if (["cancellation", "tax_invoice", "general_chat"].includes(type)) {
+    return { classification: type, confidence: null, summary: data.replyText ?? null };
+  }
   return { classification: "unknown", confidence: null, summary: data.replyText ?? null };
 }
 
@@ -4185,6 +4188,13 @@ async function commandBookingFromImage(event) {
 
   const classification = inferAiClassification(aiAnalysis, ocrText);
   console.log(`[image] pipeline:ai-classification message=${messageId} classification=${classification} elapsed_ms=${elapsedMs(startedAt)}`);
+
+  // Silent for non-actionable images
+  if (["cancellation", "tax_invoice", "general_chat"].includes(classification) ||
+      ["cancellation", "tax_invoice", "general_chat"].includes(aiAnalysis?.classification)) {
+    console.log(`[image] pipeline:silent message=${messageId} reason=${classification}`);
+    return null;
+  }
 
   if (classification === "booking") {
     const parsed = buildBookingFromAiAnalysis(aiAnalysis, ocrText);
