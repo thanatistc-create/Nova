@@ -483,16 +483,27 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
       const cutoffDate = startDate
         ? new Date(new Date(startDate).getTime() - 180 * 86400000).toISOString().slice(0, 10)
         : "2000-01-01";
-      const { data } = await supabase
+      let q = supabase
         .from("line_booking_records")
-        .select("booth_code, shop_name, table_free_qty, table_extra_qty, chair_free_qty, chair_extra_qty, power_amp, power_label, project_name, created_at")
+        .select("booth_code, shop_name, table_free_qty, table_extra_qty, chair_free_qty, chair_extra_qty, power_amp, power_label, project_name, created_at, event_start_date")
         .or(`group_id.eq.${groupId},group_id.eq.direct`)
         .eq("booking_status", "booked")
         .ilike("project_name", projectKey.replace(/%/g, "\\%"))
-        .gte("created_at", cutoffDate)
-        .order("created_at", { ascending: false }); // newest first so dedup keeps latest record
+        .order("created_at", { ascending: false });
+      // Prefer event_start_date match when available (exact event isolation), fallback to cutoff date
+      if (startDate) {
+        q = q.or(`event_start_date.eq.${startDate},event_start_date.is.null`).gte("created_at", cutoffDate);
+      }
+      const { data } = await q;
       // Exact name match, dedup by booth_code keeping newest, filter non-numeric and > totalBooths
-      const filtered = (data ?? []).filter((r) => (r.project_name ?? "").toLowerCase().trim() === projectKey);
+      // Prefer records with matching event_start_date over null
+      const filtered = (data ?? [])
+        .filter((r) => (r.project_name ?? "").toLowerCase().trim() === projectKey)
+        .sort((a, b) => {
+          const aMatch = a.event_start_date === startDate ? 0 : 1;
+          const bMatch = b.event_start_date === startDate ? 0 : 1;
+          return aMatch - bMatch; // records with matching event_start_date first
+        });
       const seen = new Map();
       for (const b of filtered) {
         const bc = b.booth_code;
@@ -846,6 +857,38 @@ const SHEET_ALIASES = [
   { thai: "\u0e1b\u0e34\u0e48\u0e19\u0e40\u0e01\u0e25\u0e49\u0e32", en: "pinklao" },
   { thai: "\u0e40\u0e0b\u0e47\u0e19\u0e17\u0e23\u0e31\u0e25", en: "central" },
 ];
+// Parse event date range from B1 header e.g. "URBAN CRAFT @ Icon siam ชั้น 3 รอบ 11-28.พค 69"
+function parseEventString(text) {
+  if (!text || typeof text !== "string") return null;
+  const THAI_MONTHS = {
+    มค: 1, "ม.ค": 1, มกราคม: 1,
+    กพ: 2, "ก.พ": 2, กุมภาพันธ์: 2,
+    มีค: 3, "มี.ค": 3, มีนาคม: 3,
+    เมย: 4, "เม.ย": 4, เมษายน: 4,
+    พค: 5, "พ.ค": 5, พฤษภาคม: 5,
+    มิย: 6, "มิ.ย": 6, มิถุนายน: 6,
+    กค: 7, "ก.ค": 7, กรกฎาคม: 7,
+    สค: 8, "ส.ค": 8, สิงหาคม: 8,
+    กย: 9, "ก.ย": 9, กันยายน: 9,
+    ตค: 10, "ต.ค": 10, ตุลาคม: 10,
+    พย: 11, "พ.ย": 11, พฤศจิกายน: 11,
+    ธค: 12, "ธ.ค": 12, ธันวาคม: 12,
+  };
+  // Match patterns like: รอบ 11-28.พค 69 / รอบ 11-28 พ.ค 69 / รอบ 11-28 พ.ย 69
+  const m = text.match(/รอบ\s*(\d{1,2})\s*[-–]\s*(\d{1,2})[.\s]*([ก-๛a-zA-Z.]{2,10})\s*(\d{2})/i);
+  if (!m) return null;
+  const [, startDay, endDay, monthRaw, yearBE] = m;
+  const monthKey = monthRaw.replace(/\./g, "");
+  const month = THAI_MONTHS[monthKey] ?? THAI_MONTHS[monthRaw] ?? null;
+  if (!month) return null;
+  const adYear = parseInt(yearBE, 10) + 2500 - 543;
+  const pad = (n) => String(parseInt(n)).padStart(2, "0");
+  return {
+    startDate: `${adYear}-${pad(month)}-${pad(startDay)}`,
+    endDate: `${adYear}-${pad(month)}-${pad(endDay)}`,
+  };
+}
+
 function scoreSheetVsProject(sheetName, proj) {
   // Expand Thai aliases in sheet name before tokenizing
   let expandedSheet = sheetName.toLowerCase();
@@ -1900,6 +1943,8 @@ async function insertBookingRecord(parsed, source, messageId) {
     chair_extra_qty: parsed.chairExtraQty ?? 0,
     power_amp: parsed.powerAmp ?? null,
     power_label: parsed.powerLabel || null,
+    event_start_date: parsed.eventStartDate ?? null,
+    event_end_date: parsed.eventEndDate ?? null,
     booking_status: "booked",
     source_user_id: source.userId ?? null,
     source_message_id: messageId ?? null,
@@ -4930,6 +4975,7 @@ async function handleFileMessage(event) {
 
     const defaultProject = await getGroupDefaultProject(groupId);
     const sheetProjectMap = {};
+    const sheetDatesMap = {};
     for (const sheetName of workbook.SheetNames) {
       const sheet = workbook.Sheets[sheetName];
       // Read B1 cell — typically contains the full event header e.g. "URBAN CRAFT @ Icon siam ชั้น 3 รอบ 11-28.พค 69"
@@ -4943,7 +4989,9 @@ async function handleFileMessage(event) {
         resolved = await resolveProjectFromSheetName(sheetName, groupId, defaultProject);
       }
       sheetProjectMap[sheetName] = resolved || defaultProject || sheetName;
-      console.log(`[file] xlsx:sheet="${sheetName}" b1="${b1Text.slice(0, 50)}" → project="${sheetProjectMap[sheetName]}"`);
+      // Parse event dates from B1 (e.g. "URBAN CRAFT @ Icon siam ชั้น 3 รอบ 11-28.พค 69")
+      sheetDatesMap[sheetName] = parseEventString(b1Text) ?? null;
+      console.log(`[file] xlsx:sheet="${sheetName}" b1="${b1Text.slice(0, 50)}" → project="${sheetProjectMap[sheetName]}" dates=${JSON.stringify(sheetDatesMap[sheetName])}`);
     }
 
     excelRows = [];
@@ -4956,6 +5004,7 @@ async function handleFileMessage(event) {
         console.log(`[file] xlsx:sample row[0]=${JSON.stringify(rows[0]).slice(0, 200)}`);
         firstSheetLogged = true;
       }
+      const sheetDates = sheetDatesMap[sheetName];
       let lastShopName = "";
       for (const row of rows) {
         const pick = (...keys) => normalizeSpaces(String(keys.map((k) => row[k] ?? "").find((v) => v !== "") ?? ""));
@@ -4967,7 +5016,11 @@ async function handleFileMessage(event) {
         const phone = pick("phone", "เบอร์โทร", "เบอร์", "Phone");
         const note = pick("note", "หมายเหตุ", "Note");
         const isSummaryRow = /^(total|รวม|ผลรวม|สรุป|summary|sub\s*total|grand\s*total|ทั้งหมด)$/i.test(shopName);
-        if (boothCode && shopName && !isSummaryRow) excelRows.push({ boothCode, shopName, projectName, phone, note });
+        if (boothCode && shopName && !isSummaryRow) excelRows.push({
+          boothCode, shopName, projectName, phone, note,
+          eventStartDate: sheetDates?.startDate ?? null,
+          eventEndDate: sheetDates?.endDate ?? null,
+        });
       }
     }
   }
