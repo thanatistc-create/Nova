@@ -467,7 +467,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
       const { data } = await supabase
         .from("line_booking_records")
         .select("booth_code, shop_name, project_name")
-        .eq("group_id", groupId)
+        .or(`group_id.eq.${groupId},group_id.eq.direct`)
         .eq("booking_status", "booked")
         .ilike("project_name", projectKey.replace(/%/g, "\\%"))
         .gte("booked_at", todayRange.startIso)
@@ -477,16 +477,33 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
     }
 
     // All active bookings — case-insensitive group
+    // Use date cutoff to exclude bookings from older events with the same project name
     let allBookings = [];
     if (groupId) {
+      const cutoffDate = startDate
+        ? new Date(new Date(startDate).getTime() - 180 * 86400000).toISOString().slice(0, 10)
+        : "2000-01-01";
       const { data } = await supabase
         .from("line_booking_records")
         .select("booth_code, shop_name, table_free_qty, table_extra_qty, chair_free_qty, chair_extra_qty, power_amp, power_label, project_name")
-        .eq("group_id", groupId)
+        .or(`group_id.eq.${groupId},group_id.eq.direct`)
         .eq("booking_status", "booked")
         .ilike("project_name", projectKey.replace(/%/g, "\\%"))
+        .gte("created_at", cutoffDate)
         .order("booth_code", { ascending: true });
-      allBookings = (data ?? []).filter((r) => (r.project_name ?? "").toLowerCase().trim() === projectKey);
+      // Exact name match, dedup by booth_code, filter booth_code > totalBooths
+      const filtered = (data ?? []).filter((r) => (r.project_name ?? "").toLowerCase().trim() === projectKey);
+      const seen = new Map();
+      for (const b of filtered) {
+        const bc = b.booth_code;
+        if (bc == null) continue;
+        try { if (totalBooths && Number(bc) > Number(totalBooths)) continue; } catch { continue; }
+        if (!seen.has(String(bc))) seen.set(String(bc), b);
+      }
+      allBookings = [...seen.values()].sort((a, b) => {
+        const na = Number(a.booth_code), nb = Number(b.booth_code);
+        return (!isNaN(na) && !isNaN(nb)) ? na - nb : String(a.booth_code).localeCompare(String(b.booth_code));
+      });
     }
 
     const bookedCount = allBookings.length;
