@@ -485,13 +485,13 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
         : "2000-01-01";
       const { data } = await supabase
         .from("line_booking_records")
-        .select("booth_code, shop_name, table_free_qty, table_extra_qty, chair_free_qty, chair_extra_qty, power_amp, power_label, project_name")
+        .select("booth_code, shop_name, table_free_qty, table_extra_qty, chair_free_qty, chair_extra_qty, power_amp, power_label, project_name, created_at")
         .or(`group_id.eq.${groupId},group_id.eq.direct`)
         .eq("booking_status", "booked")
         .ilike("project_name", projectKey.replace(/%/g, "\\%"))
         .gte("created_at", cutoffDate)
-        .order("booth_code", { ascending: true });
-      // Exact name match, dedup by booth_code, filter booth_code > totalBooths
+        .order("created_at", { ascending: false }); // newest first so dedup keeps latest record
+      // Exact name match, dedup by booth_code keeping newest, filter non-numeric and > totalBooths
       const filtered = (data ?? []).filter((r) => (r.project_name ?? "").toLowerCase().trim() === projectKey);
       const seen = new Map();
       for (const b of filtered) {
@@ -500,7 +500,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
         const bcNum = Number(bc);
         if (isNaN(bcNum)) continue; // skip non-numeric booth codes (from old events)
         if (totalBooths && bcNum > Number(totalBooths)) continue; // skip booth > capacity
-        if (!seen.has(String(bcNum))) seen.set(String(bcNum), b);
+        if (!seen.has(String(bcNum))) seen.set(String(bcNum), b); // first-seen = newest (ordered by created_at DESC)
       }
       allBookings = [...seen.values()].sort((a, b) => {
         const na = Number(a.booth_code), nb = Number(b.booth_code);
