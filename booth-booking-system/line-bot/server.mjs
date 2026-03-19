@@ -4931,8 +4931,19 @@ async function handleFileMessage(event) {
     const defaultProject = await getGroupDefaultProject(groupId);
     const sheetProjectMap = {};
     for (const sheetName of workbook.SheetNames) {
-      sheetProjectMap[sheetName] = await resolveProjectFromSheetName(sheetName, groupId, defaultProject);
-      console.log(`[file] xlsx:sheet="${sheetName}" → project="${sheetProjectMap[sheetName]}"`);
+      const sheet = workbook.Sheets[sheetName];
+      // Read B1 cell — typically contains the full event header e.g. "URBAN CRAFT @ Icon siam ชั้น 3 รอบ 11-28.พค 69"
+      const b1Text = String(sheet["B1"]?.v ?? "").trim();
+      // Try B1 content first (more specific than sheet tab name), fallback to sheet name
+      let resolved = "";
+      if (b1Text.length > 3) {
+        resolved = await resolveProjectFromSheetName(b1Text, groupId, "");
+      }
+      if (!resolved || resolved === b1Text) {
+        resolved = await resolveProjectFromSheetName(sheetName, groupId, defaultProject);
+      }
+      sheetProjectMap[sheetName] = resolved || defaultProject || sheetName;
+      console.log(`[file] xlsx:sheet="${sheetName}" b1="${b1Text.slice(0, 50)}" → project="${sheetProjectMap[sheetName]}"`);
     }
 
     excelRows = [];
