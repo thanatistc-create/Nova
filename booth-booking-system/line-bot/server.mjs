@@ -497,8 +497,10 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
       for (const b of filtered) {
         const bc = b.booth_code;
         if (bc == null) continue;
-        try { if (totalBooths && Number(bc) > Number(totalBooths)) continue; } catch { continue; }
-        if (!seen.has(String(bc))) seen.set(String(bc), b);
+        const bcNum = Number(bc);
+        if (isNaN(bcNum)) continue; // skip non-numeric booth codes (from old events)
+        if (totalBooths && bcNum > Number(totalBooths)) continue; // skip booth > capacity
+        if (!seen.has(String(bcNum))) seen.set(String(bcNum), b);
       }
       allBookings = [...seen.values()].sort((a, b) => {
         const na = Number(a.booth_code), nb = Number(b.booth_code);
