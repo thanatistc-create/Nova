@@ -650,6 +650,7 @@ function listDueImageDigestSlots(now = new Date()) {
 }
 
 async function callNovaDigest(slot, groupId) {
+  console.log("[nova-debug] ENABLED="+NOVA_ENABLED+" BASE="+NOVA_BASE_URL+" gid="+groupId);
   if (!NOVA_ENABLED || !NOVA_BASE_URL) return null;
   try {
     const res = await fetch(`${NOVA_BASE_URL}/nova_generate_digest`, {
@@ -2730,7 +2731,7 @@ async function runEventReminderScheduler() {
 
 async function pushTextToGroup(groupId, text) {
   try {
-    await lineClient.pushMessage({ to: groupId, messages: [{ type: "text", text }] });
+    await pushMessage(groupId, [{ type: "text", text }]);
   } catch (err) {
     console.error("[event-reminder] push failed:", err?.message ?? err);
   }
@@ -3056,7 +3057,7 @@ async function commandSummary(text, source) {
   const msgs = (await callNovaDigest(slot, groupId)) ?? (await buildBookingDigestMessage(slot, groupId, []));
   if (!msgs?.length) return "ไม่มีข้อมูลสรุป";
   for (let i = 1; i < msgs.length; i++) {
-    try { await lineClient.pushMessage(replyTarget, { type: "text", text: msgs[i].slice(0, 4900) }); } catch {}
+    try { await pushMessage(replyTarget, [{ type: "text", text: msgs[i].slice(0, 4900) }]); } catch (e) { console.warn("[nova] push", i, "err:", e.message); }
   }
   return msgs[0].slice(0, 4900);
 
@@ -4582,17 +4583,7 @@ async function handleTextMessage(event) {
   }
 
   if (/^\/สรุป(?:\s|$)/.test(normalized) || /^\/report(?:\s|$)/i.test(normalized)) {
-    const { dateStr, hour } = getTimePartsInTz(new Date());
-    const groupId = getGroupIdFromSource(source);
-    const pushTarget = source.groupId ?? source.roomId ?? source.userId;
-    const projectFilter = normalized.replace(/^\/สรุป\s*/i, "").replace(/^\/report\s*/i, "").trim();
-    const msgs = await buildBookingDigestMessage({ dateStr, hour }, groupId, [], projectFilter);
-    if (msgs?.length) {
-      for (let i = 0; i < msgs.length; i += 5) await pushMessage(pushTarget, msgs.slice(i, i + 5));
-    } else {
-      await pushMessage(pushTarget, [`ไม่พบโปรเจกต์ "${projectFilter}"`]);
-    }
-    return null;
+    return commandSummary(normalized, source);
   }
 
   if (normalized.startsWith(thaiBook) || /^\/book(?:\s|$)/i.test(normalized)) {
