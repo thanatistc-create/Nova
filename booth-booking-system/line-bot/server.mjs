@@ -650,7 +650,6 @@ function listDueImageDigestSlots(now = new Date()) {
 }
 
 async function callNovaDigest(slot, groupId) {
-  console.log("[nova-debug] ENABLED="+NOVA_ENABLED+" BASE="+NOVA_BASE_URL+" gid="+groupId);
   if (!NOVA_ENABLED || !NOVA_BASE_URL) return null;
   try {
     const res = await fetch(`${NOVA_BASE_URL}/nova_generate_digest`, {
@@ -3060,93 +3059,6 @@ async function commandSummary(text, source) {
     try { await pushMessage(replyTarget, [{ type: "text", text: msgs[i].slice(0, 4900) }]); } catch (e) { console.warn("[nova] push", i, "err:", e.message); }
   }
   return msgs[0].slice(0, 4900);
-
-  // legacy below (unreachable — kept for reference)
-  const projectFilter = parseProjectFilter(text);
-  let query = supabase
-    .from("line_booking_records")
-    .select("id, project_name, shop_name, phone, booth_code, booking_status, booked_at")
-    .eq("group_id", groupId)
-    .order("booked_at", { ascending: false })
-    .limit(1000);
-
-  if (projectFilter) query = query.eq("project_name", projectFilter);
-  const { data, error } = await query;
-  if (error) {
-    console.error(error);
-    return "ไม่สามารถสร้างสรุปได้";
-  }
-
-  const rows = data ?? [];
-  if (!rows.length) {
-    return projectFilter
-      ? `No records found for project: ${projectFilter}`
-      : "No booking records found";
-  }
-
-  const active = rows.filter((row) => row.booking_status === "booked");
-  const cancelled = rows.length - active.length;
-
-  const sortedActive = [...active].sort((a, b) => {
-    const projectCmp = String(a.project_name ?? "").localeCompare(String(b.project_name ?? ""));
-    if (projectCmp !== 0) return projectCmp;
-
-    const boothA = normalizeBoothCode(a.booth_code ?? "~");
-    const boothB = normalizeBoothCode(b.booth_code ?? "~");
-    const boothCmp = boothA.localeCompare(boothB);
-    if (boothCmp !== 0) return boothCmp;
-
-    return String(a.shop_name ?? "").localeCompare(String(b.shop_name ?? ""));
-  });
-
-  const lines = [];
-  lines.push(projectFilter ? `Summary: ${projectFilter}` : "Summary: all projects");
-  lines.push(`Active ${active.length} | Cancelled ${cancelled} | Total ${rows.length}`);
-  lines.push("");
-  lines.push("Active booking list (Project | Booth | Shop | Phone):");
-
-  if (!sortedActive.length) {
-    lines.push("- none");
-  } else {
-    const maxRows = 80;
-    for (let i = 0; i < Math.min(maxRows, sortedActive.length); i += 1) {
-      const row = sortedActive[i];
-      lines.push(
-        `${i + 1}. ${row.project_name} | ${normalizeBoothCode(row.booth_code) || "-"} | ${row.shop_name} | ${row.phone}`,
-      );
-    }
-    if (sortedActive.length > maxRows) {
-      lines.push(`... and ${sortedActive.length - maxRows} more active bookings`);
-    }
-  }
-
-  const boothMap = new Map();
-  for (const row of sortedActive) {
-    const booth = normalizeBoothCode(row.booth_code);
-    if (!booth) continue;
-    const key = `${row.project_name}::${booth}`;
-    if (!boothMap.has(key)) boothMap.set(key, []);
-    boothMap.get(key).push(row);
-  }
-
-  const duplicateEntries = Array.from(boothMap.entries())
-    .filter(([, items]) => items.length > 1)
-    .map(([key, items]) => ({ key, items }));
-
-  lines.push("");
-  if (!duplicateEntries.length) {
-    lines.push("Duplicate booth check: no duplicates in active bookings");
-  } else {
-    lines.push("Duplicate booth warning:");
-    for (const dup of duplicateEntries) {
-      const [projectName, booth] = dup.key.split("::");
-      const shops = dup.items.map((item) => `${item.shop_name}(${item.phone})`).join(", ");
-      lines.push(`- ${projectName} | booth ${booth} -> ${dup.items.length} bookings: ${shops}`);
-    }
-    lines.push("If old booking was cancelled, use /confirm-replace after sending new booking");
-  }
-
-  return lines.join("\n").slice(0, 4900);
 }
 
 
