@@ -3033,7 +3033,19 @@ async function commandList(text, source) {
 }
 
 async function commandSummary(text, source) {
-  const groupId = getGroupIdFromSource(source);
+  let groupId = getGroupIdFromSource(source);
+  // If calling from 1:1 (userId, not groupId/roomId), look up actual group from pricing table
+  if (!source?.groupId && !source?.roomId && source?.userId) {
+    const todayStr = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Bangkok" });
+    const { data: pg } = await supabase
+      .from("line_project_pricing")
+      .select("group_id")
+      .neq("group_id", "direct")
+      .gte("event_end_date", todayStr)
+      .order("event_start_date", { ascending: true })
+      .limit(1);
+    if (pg?.[0]?.group_id) groupId = pg[0].group_id;
+  }
   const slot = {
     dateStr: new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Bangkok" }),
     hour: new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Bangkok" })).getHours(),
