@@ -729,6 +729,8 @@ async function flushImageDigestSlot(slot) {
 
   const sentIds = new Set();
   for (const [target, groupId] of targetMap.entries()) {
+    // Skip 1:1 user IDs from scheduled digest — only push to groups (C...) and rooms (R...)
+    if (target.startsWith("U")) continue;
     const reviewItems = (grouped.get(target) ?? []).filter((i) => i?.status !== "saved");
     const messages =
       (await callNovaDigest(slot, groupId)) ??
