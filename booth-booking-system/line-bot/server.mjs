@@ -1034,7 +1034,10 @@ function normalizeKey(value) {
 
 function normalizeBoothCode(value) {
   // Strip trailing ".0" from float-stored booth codes (e.g. "2.0" → "2")
-  const s = normalizeSpaces(String(value ?? "")).replace(/^(\d+)\.0+$/, "$1");
+  let s = normalizeSpaces(String(value ?? "")).replace(/^(\d+)\.0+$/, "$1");
+  // Strip price/description noise after leading digits (e.g. "39 ราคาวันละ2,500บาท" → "39")
+  // Keeps alphanumeric codes intact (e.g. "A1", "39B" unchanged)
+  s = s.replace(/^(\d+)\s*[^\d\w].*$/u, "$1");
   return s.replace(/\s+/g, "").toUpperCase();
 }
 
