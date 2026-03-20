@@ -649,6 +649,25 @@ function listDueImageDigestSlots(now = new Date()) {
     .map((hour) => ({ dateStr: current.dateStr, hour, slotKey: `${current.dateStr}@${String(hour).padStart(2, "0")}` }));
 }
 
+async function callNovaDigest(slot, groupId) {
+  if (!NOVA_ENABLED || !NOVA_BASE_URL) return null;
+  try {
+    const res = await fetch(`${NOVA_BASE_URL}/nova_generate_digest`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ group_id: groupId, date: slot.dateStr, hour: slot.hour }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) { console.warn(`[nova] digest HTTP ${res.status}`); return null; }
+    const data = await res.json();
+    console.log(`[nova] digest ok groupId=${groupId} messages=${data?.messages?.length ?? 0}`);
+    return data?.messages?.length ? data.messages : null;
+  } catch (e) {
+    console.warn("[nova] callNovaDigest error:", e.message);
+    return null;
+  }
+}
+
 async function flushImageDigestSlot(slot) {
   const state = readImageDigestState();
   if (state.sentSlots?.[slot.slotKey]) return;
@@ -664,7 +683,7 @@ async function flushImageDigestSlot(slot) {
     return ts >= todayStartMs && ts < todayEndMs;
   });
 
-  // Group by pushTarget (use all today's events to know which groups to report to)
+  // Group by pushTarget
   const grouped = new Map();
   for (const item of todayEvents) {
     const list = grouped.get(item.pushTarget) ?? [];
@@ -672,8 +691,7 @@ async function flushImageDigestSlot(slot) {
     grouped.set(item.pushTarget, list);
   }
 
-  // Keep knownTargets up-to-date from ALL historical events (not just today's)
-  // Exclude expense groups — they should not receive booking digest
+  // Keep knownTargets up-to-date from ALL historical events
   state.knownTargets = state.knownTargets ?? {};
   for (const item of (state.events ?? [])) {
     const gid = item?.groupId ?? item?.pushTarget;
@@ -682,24 +700,24 @@ async function flushImageDigestSlot(slot) {
     }
   }
 
-  // If no image events today, still send booking digest to all known targets
-  if (!grouped.size) {
-    const knownTargets = state.knownTargets ?? {};
-    if (!Object.keys(knownTargets).length) {
-      state.sentSlots[slot.slotKey] = new Date().toISOString();
-      writeImageDigestState(state);
-      return;
-    }
-    let anyOk = false;
-    for (const [target, groupId] of Object.entries(knownTargets)) {
-      const messages = await buildBookingDigestMessage(slot, groupId, []);
-      if (!messages?.length) continue;
-      let ok = true;
-      for (let i = 0; i < messages.length; i += 5) {
-        ok = await pushMessage(target, messages.slice(i, i + 5)) && ok;
+  // Build complete target map from knownTargets + active projects in pricing table
+  const targetMap = new Map(Object.entries(state.knownTargets ?? {}));
+  try {
+    const { data: pricingData } = await supabase
+      .from("line_project_pricing")
+      .select("group_id")
+      .neq("group_id", "direct")
+      .gte("event_end_date", slot.dateStr);
+    for (const row of pricingData ?? []) {
+      if (row.group_id && !LINE_EXPENSE_GROUP_IDS.includes(row.group_id)) {
+        if (!targetMap.has(row.group_id)) targetMap.set(row.group_id, row.group_id);
       }
-      if (ok) anyOk = true;
     }
+  } catch (e) {
+    console.error("[digest] failed to load pricing group IDs:", e.message);
+  }
+
+  if (!targetMap.size) {
     state.sentSlots[slot.slotKey] = new Date().toISOString();
     writeImageDigestState(state);
     return;
@@ -710,20 +728,18 @@ async function flushImageDigestSlot(slot) {
   );
 
   const sentIds = new Set();
-  for (const [target, items] of grouped.entries()) {
-    items.sort((a, b) => String(a.occurredAt).localeCompare(String(b.occurredAt)));
-    const groupId = items.find((i) => i?.groupId)?.groupId ?? target;
-    const reviewItems = items.filter((i) => i?.status !== "saved");
-    const messages = await buildBookingDigestMessage(slot, groupId, reviewItems);
+  for (const [target, groupId] of targetMap.entries()) {
+    const reviewItems = (grouped.get(target) ?? []).filter((i) => i?.status !== "saved");
+    const messages =
+      (await callNovaDigest(slot, groupId)) ??
+      (await buildBookingDigestMessage(slot, groupId, reviewItems));
     if (!messages?.length) continue;
-    // Send up to 5 messages per LINE API call; split if more than 5
     let ok = true;
     for (let i = 0; i < messages.length; i += 5) {
       ok = await pushMessage(target, messages.slice(i, i + 5)) && ok;
     }
     if (!ok) continue;
-    if (!ok) continue;
-    for (const item of items) {
+    for (const item of (grouped.get(target) ?? [])) {
       if (pendingIds.has(item.id)) sentIds.add(item.id);
     }
   }
@@ -3015,8 +3031,20 @@ async function commandList(text, source) {
 
 async function commandSummary(text, source) {
   const groupId = getGroupIdFromSource(source);
-  const projectFilter = parseProjectFilter(text);
+  const slot = {
+    dateStr: new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Bangkok" }),
+    hour: new Date(new Date().toLocaleString("en-US", { timeZone: "Asia/Bangkok" })).getHours(),
+  };
+  const replyTarget = source?.groupId ?? source?.roomId ?? source?.userId ?? "";
+  const msgs = (await callNovaDigest(slot, groupId)) ?? (await buildBookingDigestMessage(slot, groupId, []));
+  if (!msgs?.length) return "ไม่มีข้อมูลสรุป";
+  for (let i = 1; i < msgs.length; i++) {
+    try { await lineClient.pushMessage(replyTarget, { type: "text", text: msgs[i].slice(0, 4900) }); } catch {}
+  }
+  return msgs[0].slice(0, 4900);
 
+  // legacy below (unreachable — kept for reference)
+  const projectFilter = parseProjectFilter(text);
   let query = supabase
     .from("line_booking_records")
     .select("id, project_name, shop_name, phone, booth_code, booking_status, booked_at")
