@@ -476,12 +476,21 @@ def nova_generate_digest():
         if not projects:
             return jsonify({"messages": [], "projects": 0})
 
+        def _proj_match(stored, pricing):
+            """Accept if either name contains the other (handles abbreviated stored names)."""
+            if not stored: return False
+            s = stored.lower().strip()
+            p = pricing.lower().strip()
+            return s in p or p in s
+
         messages = []
         header = f"สรุปยอดจองพื้นที่ (อัปเดต: {today} {str(hour).zfill(2)}:00)"
 
         for proj in projects:
             pname = proj["project_name"]
             pkey = pname.lower().strip()
+            # Use first word as broad DB filter; Python-side _proj_match handles abbreviated names
+            pname_first_word = pname.split()[0] if pname.split() else pname[:10]
             start = proj.get("event_start_date")
             end = proj.get("event_end_date")
             total = proj.get("total_booths")
@@ -496,16 +505,16 @@ def nova_generate_digest():
                 elif d == 0: date_label += " (งานเริ่มวันนี้!)"
                 else: date_label += " (งานเริ่มแล้ว)"
 
-            # Today bookings — use created_at (always populated) instead of booked_at
+            # Today bookings — use created_at; broad first-word filter + Python exact match
             today_res = supabase_client.table("line_booking_records") \
-                .select("booth_code,shop_name") \
+                .select("booth_code,shop_name,project_name") \
                 .or_(f"group_id.eq.{group_id},group_id.eq.direct") \
                 .eq("booking_status", "booked") \
-                .ilike("project_name", f"%{pname[:20]}%") \
+                .ilike("project_name", f"%{pname_first_word}%") \
                 .gte("created_at", start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")) \
                 .lt("created_at", end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")) \
                 .execute()
-            today_bookings = today_res.data or []
+            today_bookings = [b for b in (today_res.data or []) if _proj_match(b.get("project_name",""), pname)]
             # Dedup today_bookings by booth_code
             seen_today = {}
             for b in today_bookings:
@@ -517,15 +526,15 @@ def nova_generate_digest():
             start_date = proj.get("event_start_date", "")
             cutoff_dt = (datetime.fromisoformat(start_date) - timedelta(days=180)).strftime("%Y-%m-%d") if start_date else "2000-01-01"
             all_q = supabase_client.table("line_booking_records") \
-                .select("booth_code,shop_name,table_free_qty,table_extra_qty,chair_free_qty,chair_extra_qty,power_label,power_amp,event_start_date") \
+                .select("booth_code,shop_name,table_free_qty,table_extra_qty,chair_free_qty,chair_extra_qty,power_label,power_amp,event_start_date,project_name") \
                 .or_(f"group_id.eq.{group_id},group_id.eq.direct") \
                 .eq("booking_status", "booked") \
-                .ilike("project_name", f"%{pname[:20]}%") \
+                .ilike("project_name", f"%{pname_first_word}%") \
                 .gte("created_at", cutoff_dt)
             if start_date:
                 all_q = all_q.or_(f"event_start_date.eq.{start_date},event_start_date.is.null")
             all_res = all_q.order("created_at", desc=True).execute()
-            all_bookings_raw = all_res.data or []
+            all_bookings_raw = [b for b in (all_res.data or []) if _proj_match(b.get("project_name",""), pname)]
             # Deduplicate by booth_code (keep newest = first after DESC order), filter out booths beyond total capacity
             seen = {}
             for b in all_bookings_raw:
