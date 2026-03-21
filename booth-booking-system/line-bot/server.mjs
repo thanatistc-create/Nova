@@ -470,8 +470,8 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
         .or(`group_id.eq.${groupId},group_id.eq.direct`)
         .eq("booking_status", "booked")
         .ilike("project_name", projectKey.replace(/%/g, "\\%"))
-        .gte("booked_at", todayRange.startIso)
-        .lt("booked_at", todayRange.endIso)
+        .gte("created_at", todayRange.startIso)
+        .lt("created_at", todayRange.endIso)
         .order("booth_code", { ascending: true });
       todayBookings = (data ?? []).filter((r) => (r.project_name ?? "").toLowerCase().trim() === projectKey);
     }
@@ -495,7 +495,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
         q = q.or(`event_start_date.eq.${startDate},event_start_date.is.null`).gte("created_at", cutoffDate);
       }
       const { data } = await q;
-      // Exact name match, dedup by booth_code keeping newest, filter non-numeric and > totalBooths
+      // Exact name match, dedup by booth_code keeping newest
       // Prefer records with matching event_start_date over null
       const filtered = (data ?? [])
         .filter((r) => (r.project_name ?? "").toLowerCase().trim() === projectKey)
@@ -506,16 +506,13 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
         });
       const seen = new Map();
       for (const b of filtered) {
-        const bc = b.booth_code;
-        if (bc == null) continue;
-        const bcNum = Number(bc);
-        if (isNaN(bcNum)) continue; // skip non-numeric booth codes (from old events)
-        if (totalBooths && bcNum > Number(totalBooths)) continue; // skip booth > capacity
-        if (!seen.has(String(bcNum))) seen.set(String(bcNum), b); // first-seen = newest (ordered by created_at DESC)
+        const bc = normalizeBoothCode(b.booth_code);
+        if (!bc) continue;
+        if (!seen.has(bc)) seen.set(bc, b); // first-seen = newest (ordered by created_at DESC)
       }
       allBookings = [...seen.values()].sort((a, b) => {
-        const na = Number(a.booth_code), nb = Number(b.booth_code);
-        return (!isNaN(na) && !isNaN(nb)) ? na - nb : String(a.booth_code).localeCompare(String(b.booth_code));
+        const na = parseInt(a.booth_code, 10), nb = parseInt(b.booth_code, 10);
+        return (!isNaN(na) && !isNaN(nb) && na !== nb) ? na - nb : String(a.booth_code).localeCompare(String(b.booth_code), undefined, { numeric: true });
       });
     }
 
@@ -1967,6 +1964,7 @@ async function insertBookingRecord(parsed, source, messageId) {
     event_start_date: parsed.eventStartDate ?? null,
     event_end_date: parsed.eventEndDate ?? null,
     booking_status: "booked",
+    booked_at: new Date().toISOString(),
     source_user_id: source.userId ?? null,
     source_message_id: messageId ?? null,
   };
