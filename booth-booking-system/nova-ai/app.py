@@ -439,7 +439,7 @@ def nova_generate_digest():
         return jsonify({"error": "Unauthorized"}), 401
     data = request.get_json(force=True, silent=True) or {}
     group_id = data.get("group_id", "")
-    date_str = data.get("date_str", "")
+    date_str = data.get("date", "") or data.get("date_str", "")
     hour = data.get("hour", 9)
 
     if not supabase_client or not group_id:
@@ -496,14 +496,14 @@ def nova_generate_digest():
                 elif d == 0: date_label += " (งานเริ่มวันนี้!)"
                 else: date_label += " (งานเริ่มแล้ว)"
 
-            # Today bookings
+            # Today bookings — use created_at (always populated) instead of booked_at
             today_res = supabase_client.table("line_booking_records") \
                 .select("booth_code,shop_name") \
                 .or_(f"group_id.eq.{group_id},group_id.eq.direct") \
                 .eq("booking_status", "booked") \
                 .ilike("project_name", f"%{pname[:20]}%") \
-                .gte("booked_at", start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")) \
-                .lt("booked_at", end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")) \
+                .gte("created_at", start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")) \
+                .lt("created_at", end_utc.strftime("%Y-%m-%dT%H:%M:%SZ")) \
                 .execute()
             today_bookings = today_res.data or []
             # Dedup today_bookings by booth_code
@@ -513,20 +513,20 @@ def nova_generate_digest():
                 if bc is not None: seen_today[str(bc)] = b
             today_bookings = list(seen_today.values())
 
-            # All bookings
-            from datetime import timedelta
+            # All bookings — order by created_at DESC so dedup keeps newest record per booth
             start_date = proj.get("event_start_date", "")
             cutoff_dt = (datetime.fromisoformat(start_date) - timedelta(days=180)).strftime("%Y-%m-%d") if start_date else "2000-01-01"
-            all_res = supabase_client.table("line_booking_records") \
-                .select("booth_code,shop_name,table_free_qty,table_extra_qty,chair_free_qty,chair_extra_qty,power_label,power_amp") \
+            all_q = supabase_client.table("line_booking_records") \
+                .select("booth_code,shop_name,table_free_qty,table_extra_qty,chair_free_qty,chair_extra_qty,power_label,power_amp,event_start_date") \
                 .or_(f"group_id.eq.{group_id},group_id.eq.direct") \
                 .eq("booking_status", "booked") \
                 .ilike("project_name", f"%{pname[:20]}%") \
-                .gte("created_at", cutoff_dt) \
-                .order("booth_code") \
-                .execute()
+                .gte("created_at", cutoff_dt)
+            if start_date:
+                all_q = all_q.or_(f"event_start_date.eq.{start_date},event_start_date.is.null")
+            all_res = all_q.order("created_at", desc=True).execute()
             all_bookings_raw = all_res.data or []
-            # Deduplicate by booth_code, filter out booths beyond total capacity
+            # Deduplicate by booth_code (keep newest = first after DESC order), filter out booths beyond total capacity
             seen = {}
             for b in all_bookings_raw:
                 bc = b.get("booth_code")
