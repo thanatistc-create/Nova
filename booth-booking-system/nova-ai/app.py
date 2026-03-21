@@ -540,11 +540,16 @@ def nova_generate_digest():
             for b in all_bookings_raw:
                 bc = b.get("booth_code")
                 if bc is None: continue
+                # Normalize: strip non-numeric prefix e.g. "BOOTHNO.29" → "29"
+                bc_str = str(bc).strip()
+                m = re.search(r'(\d+)$', bc_str)
+                if m: bc_str = m.group(1)
                 try:
-                    if total and int(bc) > int(total): continue
+                    if total and int(bc_str) > int(total): continue
                 except: continue  # skip non-numeric booth codes (old events)
-                if bc not in seen:
-                    seen[bc] = b
+                if bc_str not in seen:
+                    b = dict(b); b["booth_code"] = bc_str
+                    seen[bc_str] = b
             all_bookings = list(seen.values())
             all_bookings.sort(key=lambda b: (int(b["booth_code"]) if str(b.get("booth_code","")).isdigit() else 9999))
             booked = len(all_bookings)
