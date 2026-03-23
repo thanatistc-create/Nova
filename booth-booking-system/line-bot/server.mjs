@@ -62,7 +62,9 @@ const LINE_AI_TEXT_FALLBACK_ENABLED =
   ((LINE_AI_PROVIDER === "gemini" && Boolean(GEMINI_API_KEY)) ||
     (LINE_AI_PROVIDER !== "gemini" && Boolean(OPENAI_API_KEY)));
 const LINE_AI_TEXT_MODEL = (process.env.LINE_AI_TEXT_MODEL ?? LINE_AI_IMAGE_MODEL).trim();
-const NOVA_API_URL = (process.env.NOVA_API_URL ?? "").trim();
+const _novaApiUrl = (process.env.NOVA_API_URL ?? "").trim();
+const _novaBaseUrl = (process.env.NOVA_BASE_URL ?? "").trim().replace(/\/$/, "");
+const NOVA_API_URL = _novaApiUrl || (_novaBaseUrl ? `${_novaBaseUrl}/nova_process_line_message` : "");
 const NOVA_SECRET_KEY = (process.env.NOVA_SECRET_KEY ?? "").trim();
 const NOVA_ENABLED = Boolean(NOVA_API_URL);
 const NOVA_BASE_URL = NOVA_API_URL ? NOVA_API_URL.replace(/\/nova_process_line_message.*$/, "").replace(/\/$/, "") : null;
