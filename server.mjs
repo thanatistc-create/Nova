@@ -381,11 +381,12 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
   const pricingMap = new Map(); // lowerKey → { canonicalName, startDate, endDate, totalBooths }
   const pricingActiveKeys = new Set(); // lowercase keys with end_date >= today
   const pricingKnownKeys = new Set();  // all lowercase keys in pricing table
-  if (groupId) {
-    const { data } = await supabase
+  {
+    let pricingQuery = supabase
       .from("line_project_pricing")
-      .select("project_name, event_start_date, event_end_date, total_booths")
-      .or(`group_id.eq.${groupId},group_id.eq.direct`);
+      .select("project_name, event_start_date, event_end_date, total_booths");
+    if (groupId) pricingQuery = pricingQuery.or(`group_id.eq.${groupId},group_id.eq.direct`);
+    const { data } = await pricingQuery;
     for (const row of data ?? []) {
       if (!row.project_name) continue;
       const key = row.project_name.toLowerCase().trim();
@@ -403,13 +404,14 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
   // Get all distinct project names from bookings, grouped by lowercase key
   // bookingCanonicalMap: lowerKey → best canonical name seen in bookings
   const bookingCanonicalMap = new Map();
-  if (groupId) {
-    const { data } = await supabase
+  {
+    let bookingNamesQuery = supabase
       .from("line_booking_records")
       .select("project_name")
-      .or(`group_id.eq.${groupId},group_id.eq.direct`)
       .eq("booking_status", "booked")
       .not("project_name", "is", null);
+    if (groupId) bookingNamesQuery = bookingNamesQuery.or(`group_id.eq.${groupId},group_id.eq.direct`);
+    const { data } = await bookingNamesQuery;
     for (const row of data ?? []) {
       if (!row.project_name) continue;
       const key = row.project_name.toLowerCase().trim();
@@ -453,29 +455,31 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
 
     // Today's new bookings — query case-insensitively by fetching all variants under this key
     let todayBookings = [];
-    if (todayRange && groupId) {
-      const { data } = await supabase
+    if (todayRange) {
+      let q = supabase
         .from("line_booking_records")
         .select("booth_code, shop_name, project_name")
-        .or(`group_id.eq.${groupId},group_id.eq.direct`)
         .eq("booking_status", "booked")
         .ilike("project_name", projectKey.replace(/%/g, "\\%"))
         .gte("booked_at", todayRange.startIso)
         .lt("booked_at", todayRange.endIso)
         .order("booth_code", { ascending: true });
+      if (groupId) q = q.or(`group_id.eq.${groupId},group_id.eq.direct`);
+      const { data } = await q;
       todayBookings = (data ?? []).filter((r) => (r.project_name ?? "").toLowerCase().trim() === projectKey);
     }
 
     // All active bookings — case-insensitive group
     let allBookings = [];
-    if (groupId) {
-      const { data } = await supabase
+    {
+      let q = supabase
         .from("line_booking_records")
         .select("booth_code, shop_name, table_free_qty, table_extra_qty, chair_free_qty, chair_extra_qty, power_amp, power_label, project_name")
-        .or(`group_id.eq.${groupId},group_id.eq.direct`)
         .eq("booking_status", "booked")
         .ilike("project_name", projectKey.replace(/%/g, "\\%"))
         .order("booth_code", { ascending: true });
+      if (groupId) q = q.or(`group_id.eq.${groupId},group_id.eq.direct`);
+      const { data } = await q;
       allBookings = (data ?? []).filter((r) => (r.project_name ?? "").toLowerCase().trim() === projectKey);
     }
 
@@ -4337,7 +4341,8 @@ async function handleTextMessage(event) {
 
   if (/^\/สรุป(?:\s|$)/.test(normalized) || /^\/report(?:\s|$)/i.test(normalized)) {
     const { dateStr, hour } = getTimePartsInTz(new Date());
-    const groupId = getGroupIdFromSource(source);
+    // In 1:1 chat there is no groupId — pass null to get all-group summary
+    const groupId = source?.groupId ?? source?.roomId ?? null;
     const pushTarget = source?.groupId ?? source?.roomId ?? source?.userId;
     const projectFilter = normalized.replace(/^\/สรุป\s*/i, "").replace(/^\/report\s*/i, "").trim();
     const msgs = await buildBookingDigestMessage({ dateStr, hour }, groupId, [], projectFilter);
