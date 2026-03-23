@@ -4363,7 +4363,7 @@ async function commandBookingFromImage(event) {
 
   console.log(`[image] pipeline:stop message=${messageId} reason=unclassified elapsed_ms=${elapsedMs(startedAt)}`);
   return {
-    replyText: "อ่านรูปแล้วแต่ไม่แน่ใจว่าเป็นการจองหรือค่าใช้จ่าย\nส่งเป็นข้อความด้วย /จอง หรือ /จ่าย เพื่อความแม่นยำครับ",
+    replyText: null,
     digestEvent: buildImageDigestEvent(event, { category: "failure", status: "needs_review", reason: "unclassified", detail: `classification=${classification}` }),
   };
 }
