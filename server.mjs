@@ -4342,9 +4342,10 @@ async function handleTextMessage(event) {
     const projectFilter = normalized.replace(/^\/สรุป\s*/i, "").replace(/^\/report\s*/i, "").trim();
     const msgs = await buildBookingDigestMessage({ dateStr, hour }, groupId, [], projectFilter);
     if (msgs?.length) {
-      for (let i = 0; i < msgs.length; i += 5) await pushMessage(pushTarget, msgs.slice(i, i + 5));
+      await replyMessage(event.replyToken, msgs.slice(0, 5));
+      for (let i = 5; i < msgs.length; i += 5) await pushMessage(pushTarget, msgs.slice(i, i + 5));
     } else {
-      await pushMessage(pushTarget, [`ไม่พบโปรเจกต์ "${projectFilter}"`]);
+      return projectFilter ? `ไม่พบโปรเจกต์ "${projectFilter}"` : "ยังไม่มีข้อมูลการจองวันนี้";
     }
     return null;
   }
