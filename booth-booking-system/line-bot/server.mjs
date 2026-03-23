@@ -727,6 +727,7 @@ async function flushImageDigestSlot(slot) {
   );
 
   const sentIds = new Set();
+  let anyPushed = false;
   for (const [target, groupId] of targetMap.entries()) {
     // Skip 1:1 user IDs from scheduled digest — only push to groups (C...) and rooms (R...)
     if (target.startsWith("U")) continue;
@@ -740,10 +741,14 @@ async function flushImageDigestSlot(slot) {
       ok = await pushMessage(target, messages.slice(i, i + 5)) && ok;
     }
     if (!ok) continue;
+    anyPushed = true;
     for (const item of (grouped.get(target) ?? [])) {
       if (pendingIds.has(item.id)) sentIds.add(item.id);
     }
   }
+
+  // Only mark slot as sent if at least one push succeeded — so failed slots can retry
+  if (!anyPushed) return;
 
   const sentAt = new Date().toISOString();
   if (sentIds.size) {
