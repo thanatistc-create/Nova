@@ -1997,20 +1997,14 @@ async function commandCancelExpense(source) {
 }
 
 function formatSavedBookingMessage(data, note) {
-  const tableTotal = Number(data.table_free_qty ?? 0) + Number(data.table_extra_qty ?? 0);
-  const chairTotal = Number(data.chair_free_qty ?? 0) + Number(data.chair_extra_qty ?? 0);
+  const projectName = String(data.project_name ?? "-").slice(0, 60);
+  const booth = normalizeBoothCode(data.booth_code) || "-";
   const lines = [
     `Saved (#${shortId(data.id)})`,
-    `Project: ${data.project_name}`,
-    `Shop: ${data.shop_name}`,
-    `Phone: ${data.phone}`,
-    `Booth: ${data.booth_code ?? "-"}`,
-    `Booth price: ${data.booth_price ? formatAmount(data.booth_price, "THB") : "-"}`,
-    `Tables: ${tableTotal} (free ${data.table_free_qty ?? 0} + extra ${data.table_extra_qty ?? 0})`,
-    `Chairs: ${chairTotal} (free ${data.chair_free_qty ?? 0} + extra ${data.chair_extra_qty ?? 0})`,
-    `Power: ${data.power_amp ?? "-"}A${data.power_label ? ` (${data.power_label})` : ""}`,
+    `งาน: ${projectName} | บูธ ${booth}`,
+    `ร้าน: ${data.shop_name} | โทร: ${data.phone}`,
   ];
-  if (note) lines.push("Note: detailed metadata saved");
+  if (data.booth_price) lines.push(`ราคาบูธ: ${formatAmount(data.booth_price, "THB")}`);
   return lines.join("\n");
 }
 
@@ -4042,7 +4036,6 @@ async function commandBookingFromImage(event) {
   if (!imageBuffer) {
     console.log(`[image] pipeline:stop message=${messageId} reason=fetch_failed elapsed_ms=${elapsedMs(startedAt)}`);
     return {
-      replyText: "Cannot fetch image content. Please send booking or expense as text.",
       digestEvent: buildImageDigestEvent(event, { category: "failure", status: "needs_review", reason: "fetch_failed" }),
     };
   }
@@ -4203,14 +4196,12 @@ async function commandBookingFromImage(event) {
   if (!ocrText && !LINE_AI_IMAGE_FALLBACK_ENABLED) {
     console.log(`[image] pipeline:stop message=${messageId} reason=ocr_failed elapsed_ms=${elapsedMs(startedAt)}`);
     return {
-      replyText: "OCR failed. Please send booking or expense details in text.",
       digestEvent: buildImageDigestEvent(event, { category: "failure", status: "needs_review", reason: "ocr_failed" }),
     };
   }
 
   console.log(`[image] pipeline:stop message=${messageId} reason=unclassified elapsed_ms=${elapsedMs(startedAt)}`);
   return {
-    replyText: "อ่านรูปแล้วแต่ไม่แน่ใจว่าเป็นการจองหรือค่าใช้จ่าย\nส่งเป็นข้อความด้วย /จอง หรือ /จ่าย เพื่อความแม่นยำครับ",
     digestEvent: buildImageDigestEvent(event, { category: "failure", status: "needs_review", reason: "unclassified", detail: `classification=${classification}` }),
   };
 }
