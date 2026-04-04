@@ -843,6 +843,21 @@ async function upsertProjectBoothPrice(groupId, projectName, boothPrice) {
   );
 }
 
+async function resolveCanonicalProjectName(groupId, projectName) {
+  if (!projectName) return projectName;
+  const { data, error } = await supabase
+    .from("line_project_pricing")
+    .select("project_name")
+    .eq("group_id", groupId);
+  if (error || !data?.length) return projectName;
+  const exact = data.find(r => r.project_name === projectName);
+  if (exact) return exact.project_name;
+  const lower = projectName.toLowerCase().trim();
+  const ci = data.find(r => r.project_name.toLowerCase().trim() === lower);
+  if (ci) return ci.project_name;
+  return projectName;
+}
+
 async function getProjectBoothPrice(groupId, projectName) {
   const { data, error } = await supabase
     .from("line_project_pricing")
@@ -1677,6 +1692,24 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
         "/จอง โปรเจกต์=ชื่องาน ร้าน=ชื่อร้าน บูธ=A01",
       ].join("\n"),
     };
+  }
+
+  // Reject numeric-only shop names (Excel import artifact)
+  if (/^\d+$/.test((normalized.shopName ?? "").trim())) {
+    console.log(`[booking] rejected numeric shop_name: "${normalized.shopName}"`);
+    return { ok: false, silent: true, message: "" };
+  }
+
+  // Normalize project name to canonical from line_project_pricing (case-insensitive match)
+  if (normalized.projectName) {
+    const canonical = await resolveCanonicalProjectName(
+      getGroupIdFromSource(source),
+      normalized.projectName
+    );
+    if (canonical !== normalized.projectName) {
+      console.log(`[booking] project "${normalized.projectName}" → "${canonical}"`);
+      normalized.projectName = canonical;
+    }
   }
 
   const effectiveBooking = { ...normalized };
