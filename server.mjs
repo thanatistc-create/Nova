@@ -894,6 +894,9 @@ const helpText = [
   "/book project=<name> shop=<name> phone=<phone> booth=<code> type=<product> [price=<baht>]",
   `/expense amount=<baht> [project=<name>] [vendor=<name>] [type=<type>] [note=<text>] -> default project="${DEFAULT_EXPENSE_PROJECT_NAME}" if omitted`,
   "/list [project=<name>] -> show latest bookings",
+  "/review -> รายการรอตรวจสอบ (needs_project / pending_replace)",
+  "/review fix <id> project=<ชื่องาน> -> กำหนดงานให้รายการ needs_project",
+  "/confirm-replace id=<id> -> ยืนยันแทนที่บูธซ้ำ (ใช้ได้จาก 1:1 chat)",
   "/ลิสงาน [ชื่องาน] -> ลิสร้านในงาน | /project-shop <name>",
   "/ลิสร้าน [ชื่อร้าน] -> ค้นหาร้านด้วยชื่อ | /shop <name>",
   "/summary [project=<name>] -> detailed summary + duplicate booth check",
@@ -1034,8 +1037,14 @@ function extractPhones(value) {
   const raw = String(value ?? "");
   if (!raw.trim()) return [];
 
-  const chunks = raw
-    .replace(/[\/|;]/g, " ")
+  // Strip name prefix before number: e.g. "ฝน 084-5198289" → "084-5198289"
+  // Also strip trailing labels: e.g. "094-5125619 (คุณเต็ม)" → "094-5125619"
+  const cleaned = raw
+    .replace(/\([^)]*\)/g, " ")          // remove (คุณเต็ม) etc.
+    .replace(/[\u0E00-\u0E7F]+\s*/g, " ") // remove Thai words (name prefixes)
+    .replace(/[\/|;]/g, " ");
+
+  const chunks = cleaned
     .split(/\s+/)
     .map((part) => normalizePhone(part))
     .filter(Boolean);
@@ -1782,6 +1791,7 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
             projectName: conflict.project_name,
           },
         });
+        insertPendingReplaceRecord(effectiveBooking, source, messageId, conflict.id).catch(console.error);
 
         return {
           ok: false,
@@ -1830,7 +1840,7 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
 
 async function commandConfirmReplace(source) {
   const pending = getPendingReplacement(source);
-  if (!pending) return "No pending replacement confirmation found.";
+  if (!pending) return "ไม่พบรายการรอยืนยัน ลองใช้ /confirm-replace id=<id> แทนครับ";
 
   const result = await saveBookingWithAgentRules(
     pending.parsed,
@@ -1840,6 +1850,66 @@ async function commandConfirmReplace(source) {
   );
 
   return result.silent ? null : result.message;
+}
+
+async function commandConfirmReplaceById(idPrefix, source) {
+  const isDirectChat = !source?.groupId && !source?.roomId;
+
+  let query = supabase
+    .from("line_booking_records")
+    .select("id, group_id, project_name, shop_name, phone, booth_code, product_type, note, " +
+      "table_free_qty, table_extra_qty, chair_free_qty, chair_extra_qty, " +
+      "power_amp, power_label, booth_price, source_user_id, source_message_id")
+    .eq("booking_status", "pending_replace")
+    .order("booked_at", { ascending: false })
+    .limit(200);
+  if (!isDirectChat) query = query.eq("group_id", source.groupId ?? source.roomId);
+
+  const { data, error } = await query;
+  if (error) { console.error(error); return "ดึงรายการไม่สำเร็จ"; }
+
+  const record = (data ?? []).find((r) => r.id.toLowerCase().startsWith(idPrefix.toLowerCase()));
+  if (!record) return `ไม่พบรายการ pending_replace id: ${idPrefix}`;
+
+  const conflictMatch = (record.note ?? "").match(/^pending_replace:([0-9a-fA-F-]{36})/);
+  if (!conflictMatch) return `ไม่พบ conflict ID ใน record #${shortId(record.id)}`;
+  const conflictId = conflictMatch[1];
+
+  const { error: cancelError } = await cancelRecordById(conflictId,
+    `replaced by ${record.shop_name} via /confirm-replace id=${shortId(record.id)}`);
+  if (cancelError) { console.error(cancelError); return "ยกเลิก booking เดิมไม่สำเร็จ"; }
+
+  await supabase.from("line_booking_records").delete().eq("id", record.id);
+
+  const syntheticSource = isDirectChat
+    ? { groupId: record.group_id !== "direct" ? record.group_id : undefined, userId: source.userId }
+    : source;
+
+  const cleanNote = (record.note ?? "").replace(/^pending_replace:[0-9a-fA-F-]+\s*\|\s*/, "") || null;
+  const parsed = {
+    projectName: record.project_name,
+    shopName: record.shop_name,
+    phone: record.phone,
+    boothCode: record.booth_code,
+    productType: record.product_type,
+    note: cleanNote,
+    boothPrice: record.booth_price,
+    tableFreeQty: record.table_free_qty,
+    tableExtraQty: record.table_extra_qty,
+    chairFreeQty: record.chair_free_qty,
+    chairExtraQty: record.chair_extra_qty,
+    powerAmp: record.power_amp,
+    powerLabel: record.power_label,
+  };
+
+  const { data: saved, error: insertError } = await insertBookingRecord(parsed, syntheticSource, record.source_message_id);
+  if (insertError) { console.error(insertError); return "ยกเลิก booking เดิมแล้ว แต่บันทึกใหม่ไม่สำเร็จ ลอง /จอง อีกรอบ"; }
+
+  let msg = formatSavedBookingMessage(saved, cleanNote);
+  msg += `\n(แทนที่ booking เดิม #${shortId(conflictId)})`;
+  const snap = await buildProjectSalesSnapshot(getGroupIdFromSource(syntheticSource), parsed.projectName);
+  if (snap) msg += `\n${snap}`;
+  return msg;
 }
 
 
@@ -1881,6 +1951,69 @@ async function insertBookingRecord(parsed, source, messageId) {
     .insert(basePayload)
     .select("id, project_name, shop_name, phone, booth_code, table_free_qty, table_extra_qty, chair_free_qty, chair_extra_qty, power_amp, power_label")
     .single();
+}
+
+// ── Pending-review DB helpers ─────────────────────────────────────────────────
+
+async function insertPendingProjectRecord(parsed, source, messageId) {
+  const groupId = getGroupIdFromSource(source);
+  const { error } = await supabase.from("line_booking_records").insert({
+    group_id: groupId,
+    project_name: parsed.projectName || null,
+    shop_name: parsed.shopName,
+    phone: parsed.phone || "ไม่ระบุ",
+    booth_code: parsed.boothCode || null,
+    product_type: parsed.productType || null,
+    note: parsed.note || null,
+    table_free_qty: parsed.tableFreeQty ?? 0,
+    table_extra_qty: parsed.tableExtraQty ?? 0,
+    chair_free_qty: parsed.chairFreeQty ?? 0,
+    chair_extra_qty: parsed.chairExtraQty ?? 0,
+    power_amp: parsed.powerAmp ?? null,
+    power_label: parsed.powerLabel || null,
+    booth_price: parsed.boothPrice ?? null,
+    booking_status: "needs_project",
+    source_user_id: source.userId ?? null,
+    source_message_id: messageId ?? null,
+  });
+  if (error) console.error("[pending] insertPendingProjectRecord:", error?.message);
+}
+
+async function insertPendingReplaceRecord(parsed, source, messageId, conflictId) {
+  const groupId = getGroupIdFromSource(source);
+  const notePrefix = `pending_replace:${conflictId}`;
+  const combinedNote = parsed.note
+    ? `${notePrefix} | ${parsed.note}`.slice(0, 1800)
+    : notePrefix;
+  const { error } = await supabase.from("line_booking_records").insert({
+    group_id: groupId,
+    project_name: parsed.projectName || null,
+    shop_name: parsed.shopName,
+    phone: parsed.phone || "ไม่ระบุ",
+    booth_code: parsed.boothCode || null,
+    product_type: parsed.productType || null,
+    note: combinedNote,
+    table_free_qty: parsed.tableFreeQty ?? 0,
+    table_extra_qty: parsed.tableExtraQty ?? 0,
+    chair_free_qty: parsed.chairFreeQty ?? 0,
+    chair_extra_qty: parsed.chairExtraQty ?? 0,
+    power_amp: parsed.powerAmp ?? null,
+    power_label: parsed.powerLabel || null,
+    booth_price: parsed.boothPrice ?? null,
+    booking_status: "pending_replace",
+    source_user_id: source.userId ?? null,
+    source_message_id: messageId ?? null,
+  });
+  if (error) console.error("[pending] insertPendingReplaceRecord:", error?.message);
+}
+
+async function deletePendingDbRecords(groupId, status) {
+  const { error } = await supabase
+    .from("line_booking_records")
+    .delete()
+    .eq("group_id", groupId)
+    .eq("booking_status", status);
+  if (error) console.error(`[pending] deletePendingDbRecords(${status}):`, error?.message);
 }
 
 function formatAmount(amount, currency = "THB") {
@@ -2825,6 +2958,7 @@ async function tryAutoBookingText(text, source, messageId, lineEvent = null) {
           aiParsed.projectName = activeProjects[0];
         } else if (activeProjects.length > 1) {
           setPendingProjectSelection(source, { parsed: aiParsed, messageId });
+          insertPendingProjectRecord(aiParsed, source, messageId).catch(console.error);
           const projectList = activeProjects.map((p, i) => `${i + 1}. ${p}`).join("\n");
           return `📋 ข้อมูลร้าน: ${aiParsed.shopName || "?"}\nกรุณาพิมพ์ชื่อโปรเจกต์ที่ต้องการจอง:\n${projectList}`;
         } else {
@@ -2995,6 +3129,94 @@ async function commandProjectShopList(text, source) {
 
   if (current.trim()) chunks.push(current.trim());
   return chunks.length === 1 ? chunks[0] : chunks;
+}
+
+// /review — แสดงรายการรอตรวจสอบ (needs_project / pending_replace)
+async function commandReview(source) {
+  const groupId = source?.groupId ?? source?.roomId ?? null;
+
+  let query = supabase
+    .from("line_booking_records")
+    .select("id, group_id, project_name, shop_name, booth_code, booking_status, booked_at")
+    .in("booking_status", ["needs_project", "pending_replace"])
+    .order("booked_at", { ascending: false })
+    .limit(30);
+  if (groupId) query = query.eq("group_id", groupId);
+
+  const { data, error } = await query;
+  if (error) { console.error(error); return "ดึงรายการไม่สำเร็จ"; }
+  if (!data?.length) return "ไม่มีรายการรอตรวจสอบ ✅";
+
+  const lines = [`⚠️ รายการรอตรวจสอบ (${data.length} รายการ)`];
+  for (const [i, row] of data.entries()) {
+    const sid = shortId(row.id);
+    const booth = normalizeBoothCode(row.booth_code) || "-";
+    const proj = row.project_name || "(ยังไม่ระบุงาน)";
+    const typeLabel = row.booking_status === "needs_project" ? "ยังไม่ระบุงาน" : "บูธซ้ำรอยืนยัน";
+    lines.push(`${i + 1}. #${sid} [${typeLabel}] ${row.shop_name} | บูธ ${booth} | ${proj}`);
+  }
+  lines.push("");
+  lines.push("แก้ไข:");
+  lines.push("  /review fix <id> project=<ชื่องาน>  (กำหนดงานให้รายการ needs_project)");
+  lines.push("  /confirm-replace id=<id>  (ยืนยันแทนที่บูธซ้ำ)");
+  return lines.join("\n").slice(0, 4900);
+}
+
+// /review fix <id> project=<name>
+async function commandReviewFix(text, source) {
+  const idMatch = text.match(/fix\s+([0-9a-fA-F]{6,36})/i);
+  if (!idMatch) return "วิธีใช้: /review fix <id> project=<ชื่องาน>";
+  const idPrefix = idMatch[1].toLowerCase();
+
+  const kv = parseKvSegments(text.replace(/^\/review\s+fix\s+\S+\s*/i, "/_ "));
+  const projectName = normalizeSpaces(pickValue(kv, ["project", "project_name", "โปรเจกต์", "งาน"]));
+  if (!projectName) return "วิธีใช้: /review fix <id> project=<ชื่องาน>";
+
+  const isDirectChat = !source?.groupId && !source?.roomId;
+  let query = supabase
+    .from("line_booking_records")
+    .select("id, group_id, project_name, shop_name, phone, booth_code, product_type, note, " +
+      "table_free_qty, table_extra_qty, chair_free_qty, chair_extra_qty, " +
+      "power_amp, power_label, booth_price, source_user_id, source_message_id")
+    .eq("booking_status", "needs_project")
+    .order("booked_at", { ascending: false })
+    .limit(200);
+  if (!isDirectChat) query = query.eq("group_id", source.groupId ?? source.roomId);
+
+  const { data, error } = await query;
+  if (error) { console.error(error); return "ดึงรายการไม่สำเร็จ"; }
+
+  const record = (data ?? []).find((r) => r.id.toLowerCase().startsWith(idPrefix));
+  if (!record) return `ไม่พบรายการ #${idPrefix}`;
+
+  const resolvedProject = await resolveCanonicalProjectName(record.group_id, projectName) ?? projectName;
+
+  const syntheticSource = isDirectChat
+    ? { groupId: record.group_id !== "direct" ? record.group_id : undefined, userId: source.userId }
+    : source;
+
+  // Delete the pending record first then re-run through normal booking pipeline
+  await supabase.from("line_booking_records").delete().eq("id", record.id);
+
+  const parsed = {
+    projectName: resolvedProject,
+    shopName: record.shop_name,
+    phone: record.phone,
+    boothCode: record.booth_code,
+    productType: record.product_type,
+    note: record.note,
+    boothPrice: record.booth_price,
+    tableFreeQty: record.table_free_qty,
+    tableExtraQty: record.table_extra_qty,
+    chairFreeQty: record.chair_free_qty,
+    chairExtraQty: record.chair_extra_qty,
+    powerAmp: record.power_amp,
+    powerLabel: record.power_label,
+  };
+
+  const result = await saveBookingWithAgentRules(parsed, syntheticSource, record.source_message_id);
+  if (result.silent) return null;
+  return result.message;
 }
 
 // /ลิสร้าน [ชื่อร้าน] — ค้นหาร้านด้วยชื่อ (ilike บน shop_name)
@@ -4283,6 +4505,7 @@ async function commandBookingFromImage(event) {
         parsed.projectName = activeProjects[0];
       } else if (activeProjects.length > 1) {
         setPendingProjectSelection(source, { parsed, messageId });
+        insertPendingProjectRecord(parsed, source, messageId).catch(console.error);
         const projectList = activeProjects.map((p, i) => `${i + 1}. ${p}`).join("\n");
         return {
           replyText: `📋 ข้อมูลร้าน: ${parsed.shopName || "?"}${parsed.boothCode ? ` บูธ ${parsed.boothCode}` : ""}\nกรุณาพิมพ์ชื่อโปรเจกต์ที่ต้องการจอง:\n${projectList}`,
@@ -4442,7 +4665,9 @@ async function handleTextMessage(event) {
     return `Group ID: ${gid}\nสถานะ expense: ${inWhitelist ? "✅ บันทึกได้" : "🚫 ไม่บันทึก (ไม่อยู่ใน whitelist)"}`;
   }
 
-  if (normalized === "/confirm-replace" || normalized === thaiConfirmReplace) {
+  if (/^\/confirm-replace(?:\s|$)/i.test(normalized) || /^\/ยืนยันแทนที่(?:\s|$)/.test(normalized)) {
+    const idMatch = normalized.match(/id\s*=\s*([0-9a-fA-F-]{6,36})/i);
+    if (idMatch) return commandConfirmReplaceById(idMatch[1].trim(), source);
     return commandConfirmReplace(source);
   }
 
@@ -4456,6 +4681,7 @@ async function handleTextMessage(event) {
     const typed = normalizeSpaces(rawText).trim();
     if (typed) {
       clearPendingProjectSelection(source);
+      deletePendingDbRecords(getGroupIdFromSource(source), "needs_project").catch(console.error);
       const updatedParsed = { ...pendingProjSel.parsed, projectName: typed };
       const result = await saveBookingWithAgentRules(updatedParsed, source, pendingProjSel.messageId);
       if (result.silent) return null;
@@ -4497,6 +4723,11 @@ async function handleTextMessage(event) {
 
   if (normalized.startsWith(thaiList) || /^\/list(?:\s|$)/i.test(normalized)) {
     return commandList(normalized, source);
+  }
+
+  if (/^\/review(?:\s|$)/i.test(normalized)) {
+    if (/^\/review\s+fix\s+/i.test(normalized)) return commandReviewFix(normalized, source);
+    return commandReview(source);
   }
 
   const sendChunked = async (result) => {
