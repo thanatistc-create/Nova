@@ -2931,32 +2931,30 @@ async function commandShopList(text, source) {
 
   console.log(`[shoplist] text="${text}" rawFilter="${rawFilter}" groupId="${groupId}"`);
 
-  // ---- Resolve filter: project name OR shop name search ----
-  let projectFilter = null;  // exact canonical project name (or null = all)
-  let shopFilter = null;     // partial shop name search keyword
+  // ---- Decide: project search or shop name search? ----
+  // Load all project names once, check if rawFilter matches any project
+  let projectIlike = null;  // ilike on project_name in booking records
+  let shopFilter = null;    // ilike on shop_name in booking records
 
   if (rawFilter) {
-    // 1. Try canonical project name (exact case-insensitive)
-    const canonical = await resolveCanonicalProjectName(groupId, rawFilter);
-    if (canonical && canonical.toLowerCase() !== rawFilter.toLowerCase()) {
-      projectFilter = canonical;
+    const { data: projects } = await supabase
+      .from("line_project_pricing")
+      .select("project_name")
+      .eq("group_id", groupId);
+
+    const lower = rawFilter.toLowerCase().trim();
+    const matched = (projects ?? []).some(
+      (p) =>
+        p.project_name.toLowerCase().includes(lower) ||
+        lower.includes(p.project_name.toLowerCase().trim()),
+    );
+
+    if (matched) {
+      projectIlike = rawFilter;
     } else {
-      // 2. Try partial project name (ilike)
-      const { data: proj } = await supabase
-        .from("line_project_pricing")
-        .select("project_name")
-        .eq("group_id", groupId)
-        .ilike("project_name", `%${rawFilter}%`)
-        .limit(1)
-        .maybeSingle();
-      if (proj?.project_name) {
-        projectFilter = proj.project_name;
-      } else {
-        // 3. No project match → treat as shop name search
-        shopFilter = rawFilter;
-      }
+      shopFilter = rawFilter;
     }
-    console.log(`[shoplist] resolved → project="${projectFilter}" shop="${shopFilter}"`);
+    console.log(`[shoplist] matched=${matched} projectIlike="${projectIlike}" shop="${shopFilter}"`);
   }
 
   // ---- Query bookings ----
@@ -2966,14 +2964,14 @@ async function commandShopList(text, source) {
     .eq("group_id", groupId)
     .eq("booking_status", "booked")
     .limit(1000);
-  if (projectFilter) query = query.eq("project_name", projectFilter);
-  if (shopFilter) query = query.ilike("shop_name", `%${shopFilter}%`);
+  if (projectIlike) query = query.ilike("project_name", `%${projectIlike}%`);
+  if (shopFilter)   query = query.ilike("shop_name",    `%${shopFilter}%`);
 
   const { data, error } = await query;
   if (error) { console.error(error); return "ดึงรายการไม่สำเร็จ"; }
   if (!data?.length) {
     if (shopFilter) return `ไม่พบร้านที่ชื่อ "${shopFilter}"`;
-    if (projectFilter) return `ไม่พบร้านค้าในงาน "${projectFilter}"`;
+    if (projectIlike) return `ไม่พบร้านค้าในงาน "${projectIlike}"`;
     return "ยังไม่มีรายการจองเลย";
   }
 
@@ -3002,15 +3000,15 @@ async function commandShopList(text, source) {
 
   if (shopFilter) {
     append(`🔍 ค้นหาร้าน: "${shopFilter}" (${data.length} ผล)`);
-  } else if (projectFilter) {
-    append(`📋 ลิสร้าน: ${projectFilter} (${data.length} ร้าน)`);
+  } else if (projectIlike) {
+    append(`📋 ลิสร้าน: ${projectIlike} (${data.length} ร้าน)`);
   } else {
     append(`📋 ลิสร้านทั้งหมด (${sortedProjects.length} งาน | ${data.length} ร้าน)`);
   }
 
   for (const proj of sortedProjects) {
     const rows = projectMap.get(proj);
-    if (!projectFilter) append(`\n── ${proj} (${rows.length} ร้าน) ──`);
+    if (!projectIlike || sortedProjects.length > 1) append(`\n── ${proj} (${rows.length} ร้าน) ──`);
     rows.forEach((row, i) => {
       const booth = normalizeBoothCode(row.booth_code) || "-";
       const phone = row.phone || "ไม่ระบุ";
