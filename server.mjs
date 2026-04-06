@@ -2921,7 +2921,29 @@ async function commandList(text, source) {
 
 async function commandShopList(text, source) {
   const groupId = getGroupIdFromSource(source);
-  const projectFilter = parseProjectFilter(text);
+  let projectFilter = parseProjectFilter(text);
+
+  // Fuzzy-resolve to canonical project name (case-insensitive, partial match)
+  if (projectFilter) {
+    const canonical = await resolveCanonicalProjectName(groupId, projectFilter);
+    if (canonical && canonical !== projectFilter) {
+      console.log(`[shoplist] "${projectFilter}" → "${canonical}"`);
+      projectFilter = canonical;
+    } else if (!canonical || canonical === projectFilter) {
+      // Try partial match via ilike if canonical lookup found nothing different
+      const { data: proj } = await supabase
+        .from("line_project_pricing")
+        .select("project_name")
+        .eq("group_id", groupId)
+        .ilike("project_name", `%${projectFilter}%`)
+        .limit(1)
+        .maybeSingle();
+      if (proj?.project_name) {
+        console.log(`[shoplist] ilike "${projectFilter}" → "${proj.project_name}"`);
+        projectFilter = proj.project_name;
+      }
+    }
+  }
 
   // Query all active bookings — filter by project if specified
   let query = supabase
