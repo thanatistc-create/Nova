@@ -2921,55 +2921,75 @@ async function commandList(text, source) {
 
 async function commandShopList(text, source) {
   const groupId = getGroupIdFromSource(source);
-  let projectFilter = parseProjectFilter(text);
-  if (!projectFilter) {
-    projectFilter = await getGroupDefaultProject(groupId);
-  }
-  if (!projectFilter) {
-    return "ระบุชื่องานด้วยครับ: /ลิสร้าน <ชื่องาน> หรือ /ผูกโปรเจกต์ ก่อน";
-  }
+  const projectFilter = parseProjectFilter(text);
 
-  const { data, error } = await supabase
+  // Query all active bookings — filter by project if specified
+  let query = supabase
     .from("line_booking_records")
-    .select("shop_name, booth_code, phone")
+    .select("project_name, shop_name, booth_code, phone")
     .eq("group_id", groupId)
-    .eq("project_name", projectFilter)
     .eq("booking_status", "booked")
-    .order("booth_code", { ascending: true })
-    .limit(500);
+    .limit(1000);
+  if (projectFilter) query = query.eq("project_name", projectFilter);
 
+  const { data, error } = await query;
   if (error) {
     console.error(error);
     return "ดึงรายการไม่สำเร็จ";
   }
   if (!data?.length) {
-    return `ไม่พบร้านค้าในงาน "${projectFilter}"`;
+    return projectFilter ? `ไม่พบร้านค้าในงาน "${projectFilter}"` : "ยังไม่มีรายการจองเลย";
   }
 
-  const sorted = [...data].sort((a, b) =>
-    (normalizeBoothCode(a.booth_code) || "~").localeCompare(
-      normalizeBoothCode(b.booth_code) || "~",
-    ),
-  );
+  // Group by project_name, sort booths within each project
+  const projectMap = new Map();
+  for (const row of data) {
+    const proj = row.project_name || "(ไม่ระบุงาน)";
+    if (!projectMap.has(proj)) projectMap.set(proj, []);
+    projectMap.get(proj).push(row);
+  }
+  for (const [, rows] of projectMap) {
+    rows.sort((a, b) =>
+      (normalizeBoothCode(a.booth_code) || "~").localeCompare(
+        normalizeBoothCode(b.booth_code) || "~",
+      ),
+    );
+  }
 
-  const header = `📋 ลิสร้าน: ${projectFilter} (${sorted.length} ร้าน)`;
-  const lines = sorted.map((row, i) => {
-    const booth = normalizeBoothCode(row.booth_code) || "-";
-    const phone = row.phone || "ไม่ระบุ";
-    return `${i + 1}. ${row.shop_name} | บูธ ${booth} | ${phone}`;
-  });
+  // Sort projects by name
+  const sortedProjects = [...projectMap.keys()].sort((a, b) => a.localeCompare(b));
 
+  // Build text chunks split at 4900 chars
   const chunks = [];
-  let current = header;
-  for (const line of lines) {
+  let current = "";
+
+  const append = (line) => {
     if (current.length + line.length + 1 > 4900) {
-      chunks.push(current);
+      chunks.push(current.trim());
       current = line;
     } else {
-      current += "\n" + line;
+      current += (current ? "\n" : "") + line;
     }
+  };
+
+  const totalShops = data.length;
+  if (projectFilter) {
+    append(`📋 ลิสร้าน: ${projectFilter} (${totalShops} ร้าน)`);
+  } else {
+    append(`📋 ลิสร้านทั้งหมด (${sortedProjects.length} งาน | ${totalShops} ร้าน)`);
   }
-  chunks.push(current);
+
+  for (const proj of sortedProjects) {
+    const rows = projectMap.get(proj);
+    append(`\n── ${proj} (${rows.length} ร้าน) ──`);
+    rows.forEach((row, i) => {
+      const booth = normalizeBoothCode(row.booth_code) || "-";
+      const phone = row.phone || "ไม่ระบุ";
+      append(`${i + 1}. ${row.shop_name} | บูธ ${booth} | ${phone}`);
+    });
+  }
+
+  if (current.trim()) chunks.push(current.trim());
   return chunks.length === 1 ? chunks[0] : chunks;
 }
 
