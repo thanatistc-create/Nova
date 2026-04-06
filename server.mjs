@@ -2921,7 +2921,15 @@ async function commandList(text, source) {
 
 async function commandShopList(text, source) {
   const groupId = getGroupIdFromSource(source);
-  const rawFilter = parseProjectFilter(text);
+
+  // Strip command prefix directly — more reliable than parseProjectFilter for Thai commands
+  const rawFilter = normalizeSpaces(
+    text
+      .replace(/^\/ลิสร้าน\s*/u, "")
+      .replace(/^\/shops?\s*/i, "")
+  );
+
+  console.log(`[shoplist] text="${text}" rawFilter="${rawFilter}" groupId="${groupId}"`);
 
   // ---- Resolve filter: project name OR shop name search ----
   let projectFilter = null;  // exact canonical project name (or null = all)
@@ -2948,7 +2956,7 @@ async function commandShopList(text, source) {
         shopFilter = rawFilter;
       }
     }
-    console.log(`[shoplist] rawFilter="${rawFilter}" → project="${projectFilter}" shop="${shopFilter}"`);
+    console.log(`[shoplist] resolved → project="${projectFilter}" shop="${shopFilter}"`);
   }
 
   // ---- Query bookings ----
