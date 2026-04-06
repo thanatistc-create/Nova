@@ -2941,7 +2941,7 @@ function buildShopListChunks(header, rows, showProjectTag) {
 
 // /ลิสงาน [ชื่องาน] — ลิสร้านในงาน (กรองด้วย ilike บน project_name)
 async function commandProjectShopList(text, source) {
-  const groupId = getGroupIdFromSource(source);
+  const groupId = source?.groupId ?? source?.roomId ?? null; // null = 1:1 chat → no groupId filter
   const filter = normalizeSpaces(
     text.replace(/^\/ลิสงาน\s*/u, "").replace(/^\/project-shops?\s*/i, "")
   );
@@ -2949,10 +2949,10 @@ async function commandProjectShopList(text, source) {
   let query = supabase
     .from("line_booking_records")
     .select("project_name, shop_name, booth_code, phone")
-    .eq("group_id", groupId)
     .eq("booking_status", "booked")
     .order("booth_code", { ascending: true })
     .limit(1000);
+  if (groupId) query = query.eq("group_id", groupId);
   if (filter) query = query.ilike("project_name", `%${filter}%`);
 
   const { data, error } = await query;
@@ -2999,7 +2999,7 @@ async function commandProjectShopList(text, source) {
 
 // /ลิสร้าน [ชื่อร้าน] — ค้นหาร้านด้วยชื่อ (ilike บน shop_name)
 async function commandShopList(text, source) {
-  const groupId = getGroupIdFromSource(source);
+  const groupId = source?.groupId ?? source?.roomId ?? null; // null = 1:1 chat → no groupId filter
   const filter = normalizeSpaces(
     text.replace(/^\/ลิสร้าน\s*/u, "").replace(/^\/shops?\s*/i, "")
   );
@@ -3007,9 +3007,9 @@ async function commandShopList(text, source) {
   let query = supabase
     .from("line_booking_records")
     .select("project_name, shop_name, booth_code, phone")
-    .eq("group_id", groupId)
     .eq("booking_status", "booked")
     .limit(1000);
+  if (groupId) query = query.eq("group_id", groupId);
   if (filter) query = query.ilike("shop_name", `%${filter}%`);
 
   const { data, error } = await query;
