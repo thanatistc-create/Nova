@@ -894,7 +894,8 @@ const helpText = [
   "/book project=<name> shop=<name> phone=<phone> booth=<code> type=<product> [price=<baht>]",
   `/expense amount=<baht> [project=<name>] [vendor=<name>] [type=<type>] [note=<text>] -> default project="${DEFAULT_EXPENSE_PROJECT_NAME}" if omitted`,
   "/list [project=<name>] -> show latest bookings",
-  "/ลิสร้าน [ชื่องาน] -> ร้านค้าทั้งหมด (บูธ + โทร) | /shop <name>",
+  "/ลิสงาน [ชื่องาน] -> ลิสร้านในงาน | /project-shop <name>",
+  "/ลิสร้าน [ชื่อร้าน] -> ค้นหาร้านด้วยชื่อ | /shop <name>",
   "/summary [project=<name>] -> detailed summary + duplicate booth check",
   "/sales-summary [project=<name>] -> sold booths + price + total",
   "/set-price project=<name> price=<baht> -> default booth price",
@@ -2919,59 +2920,46 @@ async function commandList(text, source) {
   return [header, ...lines].join("\n").slice(0, 4900);
 }
 
-async function commandShopList(text, source) {
-  const groupId = getGroupIdFromSource(source);
+// Helper: build and send chunked shop list output
+function buildShopListChunks(header, rows, showProjectTag) {
+  const chunks = [];
+  let current = "";
+  const append = (line) => {
+    if (current.length + line.length + 1 > 4900) { chunks.push(current.trim()); current = line; }
+    else current += (current ? "\n" : "") + line;
+  };
+  append(header);
+  rows.forEach((row, i) => {
+    const booth = normalizeBoothCode(row.booth_code) || "-";
+    const phone = row.phone || "ไม่ระบุ";
+    const tag = showProjectTag ? ` | ${row.project_name || "-"}` : "";
+    append(`${i + 1}. ${row.shop_name} | บูธ ${booth} | ${phone}${tag}`);
+  });
+  if (current.trim()) chunks.push(current.trim());
+  return chunks.length === 1 ? chunks[0] : chunks;
+}
 
-  // Strip command prefix directly — more reliable than parseProjectFilter for Thai commands
-  const rawFilter = normalizeSpaces(
-    text
-      .replace(/^\/ลิสร้าน\s*/u, "")
-      .replace(/^\/shops?\s*/i, "")
+// /ลิสงาน [ชื่องาน] — ลิสร้านในงาน (กรองด้วย ilike บน project_name)
+async function commandProjectShopList(text, source) {
+  const groupId = getGroupIdFromSource(source);
+  const filter = normalizeSpaces(
+    text.replace(/^\/ลิสงาน\s*/u, "").replace(/^\/project-shops?\s*/i, "")
   );
 
-  console.log(`[shoplist] text="${text}" rawFilter="${rawFilter}" groupId="${groupId}"`);
-
-  // ---- Decide: project search or shop name search? ----
-  // Probe booking records directly: if any record has a matching project_name → project mode
-  let projectIlike = null;
-  let shopFilter = null;
-
-  if (rawFilter) {
-    const { data: probe } = await supabase
-      .from("line_booking_records")
-      .select("id")
-      .eq("group_id", groupId)
-      .eq("booking_status", "booked")
-      .ilike("project_name", `%${rawFilter}%`)
-      .limit(1);
-
-    if (probe?.length) {
-      projectIlike = rawFilter;
-    } else {
-      shopFilter = rawFilter;
-    }
-    console.log(`[shoplist] probe=${probe?.length ?? 0} → projectIlike="${projectIlike}" shop="${shopFilter}"`);
-  }
-
-  // ---- Query bookings ----
   let query = supabase
     .from("line_booking_records")
     .select("project_name, shop_name, booth_code, phone")
     .eq("group_id", groupId)
     .eq("booking_status", "booked")
+    .order("booth_code", { ascending: true })
     .limit(1000);
-  if (projectIlike) query = query.ilike("project_name", `%${projectIlike}%`);
-  if (shopFilter)   query = query.ilike("shop_name",    `%${shopFilter}%`);
+  if (filter) query = query.ilike("project_name", `%${filter}%`);
 
   const { data, error } = await query;
   if (error) { console.error(error); return "ดึงรายการไม่สำเร็จ"; }
-  if (!data?.length) {
-    if (shopFilter) return `ไม่พบร้านที่ชื่อ "${shopFilter}"`;
-    if (projectIlike) return `ไม่พบร้านค้าในงาน "${projectIlike}"`;
-    return "ยังไม่มีรายการจองเลย";
-  }
+  if (!data?.length) return filter ? `ไม่พบงานที่ชื่อ "${filter}"` : "ยังไม่มีรายการจองเลย";
 
-  // ---- Group by project, sort by booth ----
+  // Group by project, sort booths
   const projectMap = new Map();
   for (const row of data) {
     const proj = row.project_name || "(ไม่ระบุงาน)";
@@ -2979,14 +2967,10 @@ async function commandShopList(text, source) {
     projectMap.get(proj).push(row);
   }
   for (const [, rows] of projectMap) {
-    rows.sort((a, b) =>
-      (normalizeBoothCode(a.booth_code) || "~").localeCompare(
-        normalizeBoothCode(b.booth_code) || "~"),
-    );
+    rows.sort((a, b) => (normalizeBoothCode(a.booth_code) || "~").localeCompare(normalizeBoothCode(b.booth_code) || "~"));
   }
   const sortedProjects = [...projectMap.keys()].sort((a, b) => a.localeCompare(b));
 
-  // ---- Build output ----
   const chunks = [];
   let current = "";
   const append = (line) => {
@@ -2994,27 +2978,54 @@ async function commandShopList(text, source) {
     else current += (current ? "\n" : "") + line;
   };
 
-  if (shopFilter) {
-    append(`🔍 ค้นหาร้าน: "${shopFilter}" (${data.length} ผล)`);
-  } else if (projectIlike) {
-    append(`📋 ลิสร้าน: ${projectIlike} (${data.length} ร้าน)`);
-  } else {
-    append(`📋 ลิสร้านทั้งหมด (${sortedProjects.length} งาน | ${data.length} ร้าน)`);
-  }
+  const header = filter
+    ? `📋 ลิสงาน: ${filter} (${data.length} ร้าน)`
+    : `📋 ลิสงานทั้งหมด (${sortedProjects.length} งาน | ${data.length} ร้าน)`;
+  append(header);
 
   for (const proj of sortedProjects) {
     const rows = projectMap.get(proj);
-    if (!projectIlike || sortedProjects.length > 1) append(`\n── ${proj} (${rows.length} ร้าน) ──`);
+    append(`\n── ${proj} (${rows.length} ร้าน) ──`);
     rows.forEach((row, i) => {
       const booth = normalizeBoothCode(row.booth_code) || "-";
       const phone = row.phone || "ไม่ระบุ";
-      const projTag = shopFilter ? ` | ${row.project_name || "-"}` : "";
-      append(`${i + 1}. ${row.shop_name} | บูธ ${booth} | ${phone}${projTag}`);
+      append(`${i + 1}. ${row.shop_name} | บูธ ${booth} | ${phone}`);
     });
   }
 
   if (current.trim()) chunks.push(current.trim());
   return chunks.length === 1 ? chunks[0] : chunks;
+}
+
+// /ลิสร้าน [ชื่อร้าน] — ค้นหาร้านด้วยชื่อ (ilike บน shop_name)
+async function commandShopList(text, source) {
+  const groupId = getGroupIdFromSource(source);
+  const filter = normalizeSpaces(
+    text.replace(/^\/ลิสร้าน\s*/u, "").replace(/^\/shops?\s*/i, "")
+  );
+
+  let query = supabase
+    .from("line_booking_records")
+    .select("project_name, shop_name, booth_code, phone")
+    .eq("group_id", groupId)
+    .eq("booking_status", "booked")
+    .limit(1000);
+  if (filter) query = query.ilike("shop_name", `%${filter}%`);
+
+  const { data, error } = await query;
+  if (error) { console.error(error); return "ดึงรายการไม่สำเร็จ"; }
+  if (!data?.length) return filter ? `ไม่พบร้านที่ชื่อ "${filter}"` : "ยังไม่มีรายการจองเลย";
+
+  // Sort by project then booth
+  const sorted = [...data].sort((a, b) => {
+    const pc = (a.project_name || "").localeCompare(b.project_name || "");
+    return pc !== 0 ? pc : (normalizeBoothCode(a.booth_code) || "~").localeCompare(normalizeBoothCode(b.booth_code) || "~");
+  });
+
+  const header = filter
+    ? `🔍 ค้นร้าน: "${filter}" (${sorted.length} ผล)`
+    : `🔍 ลิสร้านทั้งหมด (${sorted.length} ร้าน)`;
+  return buildShopListChunks(header, sorted, true);
 }
 
 async function commandSummary(text, source) {
@@ -4405,6 +4416,7 @@ async function handleTextMessage(event) {
   const thaiBook = "/จอง";
   const thaiList = "/รายการ";
   const thaiShopList = "/ลิสร้าน";
+  const thaiProjectShopList = "/ลิสงาน";
   const thaiSummary = "/สรุป";
   const thaiSalesSummary = "/ยอดขาย";
   const thaiSetPrice = "/ตั้งราคาบูธ";
@@ -4487,15 +4499,20 @@ async function handleTextMessage(event) {
     return commandList(normalized, source);
   }
 
+  const sendChunked = async (result) => {
+    if (!Array.isArray(result)) return result;
+    await replyMessage(event.replyToken, [{ type: "text", text: result[0] }]);
+    const pushTarget = source?.groupId ?? source?.roomId ?? source?.userId;
+    for (let i = 1; i < result.length; i++) await pushMessage(pushTarget, [{ type: "text", text: result[i] }]);
+    return null;
+  };
+
+  if (normalized.startsWith(thaiProjectShopList) || /^\/project-shops?(?:\s|$)/i.test(normalized)) {
+    return sendChunked(await commandProjectShopList(normalized, source));
+  }
+
   if (normalized.startsWith(thaiShopList) || /^\/shops?(?:\s|$)/i.test(normalized)) {
-    const result = await commandShopList(normalized, source);
-    if (Array.isArray(result)) {
-      await replyMessage(event.replyToken, [{ type: "text", text: result[0] }]);
-      const pushTarget = source?.groupId ?? source?.roomId ?? source?.userId;
-      for (let i = 1; i < result.length; i++) await pushMessage(pushTarget, [{ type: "text", text: result[i] }]);
-      return null;
-    }
-    return result;
+    return sendChunked(await commandShopList(normalized, source));
   }
 
   if (normalized.startsWith(thaiSummary) || /^\/(summary|sum)(?:\s|$)/i.test(normalized)) {
