@@ -2932,29 +2932,25 @@ async function commandShopList(text, source) {
   console.log(`[shoplist] text="${text}" rawFilter="${rawFilter}" groupId="${groupId}"`);
 
   // ---- Decide: project search or shop name search? ----
-  // Load all project names once, check if rawFilter matches any project
-  let projectIlike = null;  // ilike on project_name in booking records
-  let shopFilter = null;    // ilike on shop_name in booking records
+  // Probe booking records directly: if any record has a matching project_name → project mode
+  let projectIlike = null;
+  let shopFilter = null;
 
   if (rawFilter) {
-    const { data: projects } = await supabase
-      .from("line_project_pricing")
-      .select("project_name")
-      .eq("group_id", groupId);
+    const { data: probe } = await supabase
+      .from("line_booking_records")
+      .select("id")
+      .eq("group_id", groupId)
+      .eq("booking_status", "booked")
+      .ilike("project_name", `%${rawFilter}%`)
+      .limit(1);
 
-    const lower = rawFilter.toLowerCase().trim();
-    const matched = (projects ?? []).some(
-      (p) =>
-        p.project_name.toLowerCase().includes(lower) ||
-        lower.includes(p.project_name.toLowerCase().trim()),
-    );
-
-    if (matched) {
+    if (probe?.length) {
       projectIlike = rawFilter;
     } else {
       shopFilter = rawFilter;
     }
-    console.log(`[shoplist] matched=${matched} projectIlike="${projectIlike}" shop="${shopFilter}"`);
+    console.log(`[shoplist] probe=${probe?.length ?? 0} → projectIlike="${projectIlike}" shop="${shopFilter}"`);
   }
 
   // ---- Query bookings ----
