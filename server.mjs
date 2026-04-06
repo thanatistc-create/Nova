@@ -2921,31 +2921,37 @@ async function commandList(text, source) {
 
 async function commandShopList(text, source) {
   const groupId = getGroupIdFromSource(source);
-  let projectFilter = parseProjectFilter(text);
+  const rawFilter = parseProjectFilter(text);
 
-  // Fuzzy-resolve to canonical project name (case-insensitive, partial match)
-  if (projectFilter) {
-    const canonical = await resolveCanonicalProjectName(groupId, projectFilter);
-    if (canonical && canonical !== projectFilter) {
-      console.log(`[shoplist] "${projectFilter}" → "${canonical}"`);
+  // ---- Resolve filter: project name OR shop name search ----
+  let projectFilter = null;  // exact canonical project name (or null = all)
+  let shopFilter = null;     // partial shop name search keyword
+
+  if (rawFilter) {
+    // 1. Try canonical project name (exact case-insensitive)
+    const canonical = await resolveCanonicalProjectName(groupId, rawFilter);
+    if (canonical && canonical.toLowerCase() !== rawFilter.toLowerCase()) {
       projectFilter = canonical;
-    } else if (!canonical || canonical === projectFilter) {
-      // Try partial match via ilike if canonical lookup found nothing different
+    } else {
+      // 2. Try partial project name (ilike)
       const { data: proj } = await supabase
         .from("line_project_pricing")
         .select("project_name")
         .eq("group_id", groupId)
-        .ilike("project_name", `%${projectFilter}%`)
+        .ilike("project_name", `%${rawFilter}%`)
         .limit(1)
         .maybeSingle();
       if (proj?.project_name) {
-        console.log(`[shoplist] ilike "${projectFilter}" → "${proj.project_name}"`);
         projectFilter = proj.project_name;
+      } else {
+        // 3. No project match → treat as shop name search
+        shopFilter = rawFilter;
       }
     }
+    console.log(`[shoplist] rawFilter="${rawFilter}" → project="${projectFilter}" shop="${shopFilter}"`);
   }
 
-  // Query all active bookings — filter by project if specified
+  // ---- Query bookings ----
   let query = supabase
     .from("line_booking_records")
     .select("project_name, shop_name, booth_code, phone")
@@ -2953,17 +2959,17 @@ async function commandShopList(text, source) {
     .eq("booking_status", "booked")
     .limit(1000);
   if (projectFilter) query = query.eq("project_name", projectFilter);
+  if (shopFilter) query = query.ilike("shop_name", `%${shopFilter}%`);
 
   const { data, error } = await query;
-  if (error) {
-    console.error(error);
-    return "ดึงรายการไม่สำเร็จ";
-  }
+  if (error) { console.error(error); return "ดึงรายการไม่สำเร็จ"; }
   if (!data?.length) {
-    return projectFilter ? `ไม่พบร้านค้าในงาน "${projectFilter}"` : "ยังไม่มีรายการจองเลย";
+    if (shopFilter) return `ไม่พบร้านที่ชื่อ "${shopFilter}"`;
+    if (projectFilter) return `ไม่พบร้านค้าในงาน "${projectFilter}"`;
+    return "ยังไม่มีรายการจองเลย";
   }
 
-  // Group by project_name, sort booths within each project
+  // ---- Group by project, sort by booth ----
   const projectMap = new Map();
   for (const row of data) {
     const proj = row.project_name || "(ไม่ระบุงาน)";
@@ -2973,41 +2979,35 @@ async function commandShopList(text, source) {
   for (const [, rows] of projectMap) {
     rows.sort((a, b) =>
       (normalizeBoothCode(a.booth_code) || "~").localeCompare(
-        normalizeBoothCode(b.booth_code) || "~",
-      ),
+        normalizeBoothCode(b.booth_code) || "~"),
     );
   }
-
-  // Sort projects by name
   const sortedProjects = [...projectMap.keys()].sort((a, b) => a.localeCompare(b));
 
-  // Build text chunks split at 4900 chars
+  // ---- Build output ----
   const chunks = [];
   let current = "";
-
   const append = (line) => {
-    if (current.length + line.length + 1 > 4900) {
-      chunks.push(current.trim());
-      current = line;
-    } else {
-      current += (current ? "\n" : "") + line;
-    }
+    if (current.length + line.length + 1 > 4900) { chunks.push(current.trim()); current = line; }
+    else current += (current ? "\n" : "") + line;
   };
 
-  const totalShops = data.length;
-  if (projectFilter) {
-    append(`📋 ลิสร้าน: ${projectFilter} (${totalShops} ร้าน)`);
+  if (shopFilter) {
+    append(`🔍 ค้นหาร้าน: "${shopFilter}" (${data.length} ผล)`);
+  } else if (projectFilter) {
+    append(`📋 ลิสร้าน: ${projectFilter} (${data.length} ร้าน)`);
   } else {
-    append(`📋 ลิสร้านทั้งหมด (${sortedProjects.length} งาน | ${totalShops} ร้าน)`);
+    append(`📋 ลิสร้านทั้งหมด (${sortedProjects.length} งาน | ${data.length} ร้าน)`);
   }
 
   for (const proj of sortedProjects) {
     const rows = projectMap.get(proj);
-    append(`\n── ${proj} (${rows.length} ร้าน) ──`);
+    if (!projectFilter) append(`\n── ${proj} (${rows.length} ร้าน) ──`);
     rows.forEach((row, i) => {
       const booth = normalizeBoothCode(row.booth_code) || "-";
       const phone = row.phone || "ไม่ระบุ";
-      append(`${i + 1}. ${row.shop_name} | บูธ ${booth} | ${phone}`);
+      const projTag = shopFilter ? ` | ${row.project_name || "-"}` : "";
+      append(`${i + 1}. ${row.shop_name} | บูธ ${booth} | ${phone}${projTag}`);
     });
   }
 
