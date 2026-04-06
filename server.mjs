@@ -894,6 +894,7 @@ const helpText = [
   "/book project=<name> shop=<name> phone=<phone> booth=<code> type=<product> [price=<baht>]",
   `/expense amount=<baht> [project=<name>] [vendor=<name>] [type=<type>] [note=<text>] -> default project="${DEFAULT_EXPENSE_PROJECT_NAME}" if omitted`,
   "/list [project=<name>] -> show latest bookings",
+  "/ลิสร้าน [ชื่องาน] -> ร้านค้าทั้งหมด (บูธ + โทร) | /shop <name>",
   "/summary [project=<name>] -> detailed summary + duplicate booth check",
   "/sales-summary [project=<name>] -> sold booths + price + total",
   "/set-price project=<name> price=<baht> -> default booth price",
@@ -2918,6 +2919,60 @@ async function commandList(text, source) {
   return [header, ...lines].join("\n").slice(0, 4900);
 }
 
+async function commandShopList(text, source) {
+  const groupId = getGroupIdFromSource(source);
+  let projectFilter = parseProjectFilter(text);
+  if (!projectFilter) {
+    projectFilter = await getGroupDefaultProject(groupId);
+  }
+  if (!projectFilter) {
+    return "ระบุชื่องานด้วยครับ: /ลิสร้าน <ชื่องาน> หรือ /ผูกโปรเจกต์ ก่อน";
+  }
+
+  const { data, error } = await supabase
+    .from("line_booking_records")
+    .select("shop_name, booth_code, phone")
+    .eq("group_id", groupId)
+    .eq("project_name", projectFilter)
+    .eq("booking_status", "booked")
+    .order("booth_code", { ascending: true })
+    .limit(500);
+
+  if (error) {
+    console.error(error);
+    return "ดึงรายการไม่สำเร็จ";
+  }
+  if (!data?.length) {
+    return `ไม่พบร้านค้าในงาน "${projectFilter}"`;
+  }
+
+  const sorted = [...data].sort((a, b) =>
+    (normalizeBoothCode(a.booth_code) || "~").localeCompare(
+      normalizeBoothCode(b.booth_code) || "~",
+    ),
+  );
+
+  const header = `📋 ลิสร้าน: ${projectFilter} (${sorted.length} ร้าน)`;
+  const lines = sorted.map((row, i) => {
+    const booth = normalizeBoothCode(row.booth_code) || "-";
+    const phone = row.phone || "ไม่ระบุ";
+    return `${i + 1}. ${row.shop_name} | บูธ ${booth} | ${phone}`;
+  });
+
+  const chunks = [];
+  let current = header;
+  for (const line of lines) {
+    if (current.length + line.length + 1 > 4900) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current += "\n" + line;
+    }
+  }
+  chunks.push(current);
+  return chunks.length === 1 ? chunks[0] : chunks;
+}
+
 async function commandSummary(text, source) {
   const groupId = getGroupIdFromSource(source);
   const projectFilter = parseProjectFilter(text);
@@ -4305,6 +4360,7 @@ async function handleTextMessage(event) {
   const thaiBind = "/ผูกโปรเจกต์";
   const thaiBook = "/จอง";
   const thaiList = "/รายการ";
+  const thaiShopList = "/ลิสร้าน";
   const thaiSummary = "/สรุป";
   const thaiSalesSummary = "/ยอดขาย";
   const thaiSetPrice = "/ตั้งราคาบูธ";
@@ -4385,6 +4441,17 @@ async function handleTextMessage(event) {
 
   if (normalized.startsWith(thaiList) || /^\/list(?:\s|$)/i.test(normalized)) {
     return commandList(normalized, source);
+  }
+
+  if (normalized.startsWith(thaiShopList) || /^\/shops?(?:\s|$)/i.test(normalized)) {
+    const result = await commandShopList(normalized, source);
+    if (Array.isArray(result)) {
+      await replyMessage(event.replyToken, [{ type: "text", text: result[0] }]);
+      const pushTarget = source?.groupId ?? source?.roomId ?? source?.userId;
+      for (let i = 1; i < result.length; i++) await pushMessage(pushTarget, [{ type: "text", text: result[i] }]);
+      return null;
+    }
+    return result;
   }
 
   if (normalized.startsWith(thaiSummary) || /^\/(summary|sum)(?:\s|$)/i.test(normalized)) {
