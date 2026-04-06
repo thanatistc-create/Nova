@@ -3093,9 +3093,22 @@ async function commandProjectShopList(text, source) {
   if (error) { console.error(error); return "ดึงรายการไม่สำเร็จ"; }
   if (!data?.length) return filter ? `ไม่พบงานที่ชื่อ "${filter}"` : "ยังไม่มีรายการจองเลย";
 
+  // Deduplicate: same shop + same booth (across project name variants) → most complete record
+  const completeness = (row) =>
+    (row.phone && row.phone !== "ไม่ระบุ" ? 4 : 0) +
+    (row.project_name ? 2 : 0) +
+    (row.booth_code ? 1 : 0);
+  const dedupMap2 = new Map();
+  for (const row of data) {
+    const key = `${normalizeKey(row.shop_name)}::${normalizeBoothCode(row.booth_code) || "-"}`;
+    const existing = dedupMap2.get(key);
+    if (!existing || completeness(row) > completeness(existing)) dedupMap2.set(key, row);
+  }
+  const dedupedData = [...dedupMap2.values()];
+
   // Group by project, sort booths
   const projectMap = new Map();
-  for (const row of data) {
+  for (const row of dedupedData) {
     const proj = row.project_name || "(ไม่ระบุงาน)";
     if (!projectMap.has(proj)) projectMap.set(proj, []);
     projectMap.get(proj).push(row);
@@ -3238,8 +3251,21 @@ async function commandShopList(text, source) {
   if (error) { console.error(error); return "ดึงรายการไม่สำเร็จ"; }
   if (!data?.length) return filter ? `ไม่พบร้านที่ชื่อ "${filter}"` : "ยังไม่มีรายการจองเลย";
 
+  // Deduplicate: same shop + same booth → keep the most complete record
+  const completeness = (row) =>
+    (row.phone && row.phone !== "ไม่ระบุ" ? 4 : 0) +
+    (row.project_name ? 2 : 0) +
+    (row.booth_code ? 1 : 0);
+  const dedupMap = new Map();
+  for (const row of data) {
+    const key = `${normalizeKey(row.shop_name)}::${normalizeBoothCode(row.booth_code) || "-"}`;
+    const existing = dedupMap.get(key);
+    if (!existing || completeness(row) > completeness(existing)) dedupMap.set(key, row);
+  }
+  const deduped = [...dedupMap.values()];
+
   // Sort by project then booth
-  const sorted = [...data].sort((a, b) => {
+  const sorted = [...deduped].sort((a, b) => {
     const pc = (a.project_name || "").localeCompare(b.project_name || "");
     return pc !== 0 ? pc : (normalizeBoothCode(a.booth_code) || "~").localeCompare(normalizeBoothCode(b.booth_code) || "~");
   });
