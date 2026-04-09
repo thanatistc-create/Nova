@@ -5158,20 +5158,46 @@ async function handleFileMessage(event) {
   }
 
   // ── Try Nova first for intelligent AI parsing ──────────────────────────────
+  // Also parse XLSX locally to get raw phone values (Nova may miss Thai-prefixed phones)
+  let localPhoneMap = new Map(); // key: "sheetIndex:boothCode" or "sheetIndex:rowIndex"
+  try {
+    const xlsxMod = await import("xlsx");
+    const XLSX = xlsxMod.default ?? xlsxMod;
+    const wb = XLSX.read(buffer, { type: "buffer" });
+    wb.SheetNames.forEach((sheetName, si) => {
+      const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { defval: "" });
+      rows.forEach((row, ri) => {
+        const pickRaw = (...keys) => String(keys.map((k) => row[k] ?? "").find((v) => v !== "") ?? "");
+        const rawPhone = pickRaw("phone", "เบอร์โทร", "เบอร์", "Phone");
+        const rawBooth = normalizeSpaces(String(pickRaw("booth_code", "บูธ", "เลขบูธ", "Booth", "BOOTH"))).replace(/^(\d+)\.0+$/, "$1");
+        if (rawPhone) {
+          if (rawBooth) localPhoneMap.set(`${si}:${rawBooth}`, rawPhone);
+          localPhoneMap.set(`${si}:${ri}`, rawPhone);
+        }
+      });
+    });
+  } catch { /* xlsx not available or parse error — proceed without local phone map */ }
+
   const novaRows = await callNovaForExcel(buffer, fileName, knownProjects);
   let excelRows;
   if (novaRows) {
     excelRows = novaRows
-      .map((r) => {
+      .map((r, ri) => {
         const tcPrice = Number(r.tableChairPrice) || 0;
         const tableFreeQty = Math.floor(tcPrice / 350);
         const chairFreeQty = Math.floor((tcPrice % 350) / 80);
         const pwLabel = powerPriceToLabel(Number(r.powerPrice) || 0);
+        const boothCode = normalizeSpaces(String(r.boothCode ?? "")).replace(/^(\d+)\.0+$/, "$1");
+        const novaPhone = normalizeSpaces(String(r.phone ?? ""));
+        // If Nova returned empty phone, fall back to raw local XLSX value so extractPhones can parse it
+        const sheetIdx = Number(r._sheetIndex ?? 0);
+        const rawLocalPhone = localPhoneMap.get(`${sheetIdx}:${boothCode}`) || localPhoneMap.get(`${sheetIdx}:${ri}`) || "";
+        const phone = novaPhone || rawLocalPhone;
         return {
-          boothCode: normalizeSpaces(String(r.boothCode ?? "")).replace(/^(\d+)\.0+$/, "$1"),
+          boothCode,
           shopName: normalizeSpaces(String(r.shopName ?? "")),
           projectName: normalizeSpaces(String(r.projectName ?? "")),
-          phone: normalizeSpaces(String(r.phone ?? "")),
+          phone,
           note: normalizeSpaces(String(r.note ?? "")),
           tableFreeQty,
           chairFreeQty,
