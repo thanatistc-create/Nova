@@ -2991,13 +2991,18 @@ async function tryAutoBookingText(text, source, messageId, lineEvent = null) {
     }
     const aiSaveResult = await saveBookingWithAgentRules(aiParsed, source, messageId);
     console.log(`[text] ai:saveResult ok=${aiSaveResult.ok} silent=${aiSaveResult.silent ?? false} project=${aiParsed.projectName ?? "-"} shop=${aiParsed.shopName ?? "-"}`);
-    return null; // silent — no immediate reply
+    // In 1:1 chat reply directly since there is no group digest
+    if (!source?.groupId && !source?.roomId) {
+      return aiSaveResult.message ?? (aiSaveResult.ok ? `✅ บันทึกแล้ว: ${aiParsed.shopName ?? ""} บูธ ${aiParsed.boothCode ?? "-"} (${aiParsed.projectName ?? "-"})` : null);
+    }
+    return null; // silent — reported in digest
   }
 
   const result = await saveBookingWithAgentRules(parsed, source, messageId);
   console.log(`[text] saveResult ok=${result.ok} silent=${result.silent ?? false} needsConfirmation=${result.needsConfirmation ?? false}`);
   if (!result.ok) return result.needsConfirmation ? result.message : null;
   const bkPushTarget = getImageDigestPushTarget(source ?? {});
+  const isDirectChat = !source?.groupId && !source?.roomId;
   if (bkPushTarget) {
     queueImageDigestEvent({
       pushTarget: bkPushTarget,
@@ -3018,6 +3023,8 @@ async function tryAutoBookingText(text, source, messageId, lineEvent = null) {
     });
     startImageDigestScheduler();
   }
+  // In 1:1 chat there is no group digest — reply directly
+  if (isDirectChat) return result.message ?? `✅ บันทึกแล้ว: ${parsed.shopName ?? ""} บูธ ${parsed.boothCode ?? "-"} (${parsed.projectName ?? "-"})`;
   return null; // silent - reported in digest
 }
 
