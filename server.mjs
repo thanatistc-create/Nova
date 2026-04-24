@@ -1171,8 +1171,24 @@ function normalizeKey(value) {
 }
 
 function normalizeBoothCode(value) {
-  const s = normalizeSpaces(String(value ?? "")).replace(/^(\d+)\.0+$/, "$1");
-  return s.replace(/\s+/g, "").toUpperCase();
+  const raw = normalizeSpaces(toAsciiDigits(String(value ?? "")))
+    .replace(/^(\d+)\.0+$/, "$1")
+    .replace(/^(?:\u0e40\u0e25\u0e02)?(?:\u0e1a\u0e39\u0e18|\u0e1a\u0e39\u0e17|booth)\s*/i, "");
+  if (!raw) return "";
+
+  const matched = raw.match(/^[A-Za-z]*\d+[A-Za-z0-9-]*/);
+  const code = matched?.[0] ?? raw.split(/\s+/)[0] ?? "";
+  return code.replace(/\s+/g, "").toUpperCase();
+}
+
+function extractBoothPriceFromText(value) {
+  const raw = normalizeSpaces(toAsciiDigits(String(value ?? "")));
+  if (!raw) return null;
+
+  const matched = raw.match(
+    /(?:\u0e27\u0e31\u0e19\u0e25\u0e30|\u0e23\u0e32\u0e04\u0e32|\u0e04\u0e48\u0e32\u0e1a\u0e39\u0e18|\u0e04\u0e48\u0e32\u0e1a\u0e39\u0e17|\u0e04\u0e48\u0e32\u0e40\u0e0a\u0e48\u0e32|price)\s*[:=]?\s*([0-9][0-9,]*(?:\.\d{1,2})?)/i,
+  );
+  return matched ? normalizeAmount(matched[1]) : null;
 }
 
 function stripListPrefix(value) {
@@ -1635,7 +1651,7 @@ async function parseBookingCommand(text, groupId) {
   const note = pickValue(kv, ["หมายเหตุ", "note"]);
   const boothPrice = normalizeAmount(
     pickValue(kv, ["ราคา", "ค่าบูธ", "ค่าเช่า", "price", "booth_price"]),
-  );
+  ) ?? extractBoothPriceFromText(boothCode);
   const { eventStartDate, eventEndDate } = extractEventDateRange(eventDateText);
 
   const equipment = parseEquipmentFields({
@@ -1746,7 +1762,7 @@ async function parseBookingFormText(text, groupId) {
   const boothPriceRaw = normalizeSpaces(
     pickByLabel(fields, ["ราคาบูธ", "ราคา", "ค่าบูธ", "ค่าเช่า", "ค่าพื้นที่", "price", "booth price"]),
   );
-  const boothPrice = normalizeAmount(boothPriceRaw);
+  const boothPrice = normalizeAmount(boothPriceRaw) ?? extractBoothPriceFromText(boothCode);
   const { eventStartDate, eventEndDate } = extractEventDateRange(eventDateText);
 
   const equipment = parseEquipmentFields({
