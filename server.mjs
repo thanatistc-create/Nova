@@ -54,7 +54,7 @@ const LINE_AI_IMAGE_FALLBACK_ENABLED =
 const LINE_IMAGE_GROUP_REPLY_MODE = (process.env.LINE_IMAGE_GROUP_REPLY_MODE ?? "immediate").trim().toLowerCase();
 const LINE_IMAGE_SUMMARY_ENABLED =
   String(process.env.LINE_IMAGE_SUMMARY_ENABLED ?? (LINE_IMAGE_GROUP_REPLY_MODE === "digest" ? "true" : "false")).toLowerCase() !== "false";
-const LINE_IMAGE_SUMMARY_HOURS = parseDigestHours(process.env.LINE_IMAGE_SUMMARY_HOURS ?? "9,17");
+const LINE_IMAGE_SUMMARY_HOURS = parseDigestHours(process.env.LINE_IMAGE_SUMMARY_HOURS ?? "17");
 const LINE_IMAGE_SUMMARY_MAX_ITEMS = normalizeDigestMaxItems(process.env.LINE_IMAGE_SUMMARY_MAX_ITEMS, 8);
 const IMAGE_DIGEST_STATE_FILE = path.join(__dirname, ".line-image-digest.json");
 const LINE_AI_TEXT_FALLBACK_ENABLED =
