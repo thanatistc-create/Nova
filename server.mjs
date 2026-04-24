@@ -83,6 +83,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { autoRefreshToken: false, persistSession: false },
 });
 const PENDING_REPLACE_TTL_MS = 15 * 60 * 1000;
+const BOOKING_CONFLICT_LOOKBACK_DAYS = 60;
 const pendingReplacementByActor = new Map();
 const pendingExpenseByActor = new Map();
 const pendingProjectSelectionByActor = new Map();
@@ -420,9 +421,26 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
     }
   }
 
+  const todayBookingKeys = new Set();
+  if (todayRange) {
+    let todayBookingNamesQuery = supabase
+      .from("line_booking_records")
+      .select("project_name")
+      .eq("booking_status", "booked")
+      .not("project_name", "is", null)
+      .gte("booked_at", todayRange.startIso)
+      .lt("booked_at", todayRange.endIso);
+    if (groupId) todayBookingNamesQuery = todayBookingNamesQuery.or(`group_id.eq.${groupId},group_id.eq.direct`);
+    const { data } = await todayBookingNamesQuery;
+    for (const row of data ?? []) {
+      if (!row.project_name) continue;
+      todayBookingKeys.add(row.project_name.toLowerCase().trim());
+    }
+  }
+
   // Build active project list: only projects with future end_date in pricing
-  // (exclude orphaned bookings to prevent historical Excel imports from polluting digest)
-  const activeKeySet = new Set([...pricingActiveKeys]);
+  // Keep today's booked projects visible even if their pricing row has not been created yet.
+  const activeKeySet = new Set([...pricingActiveKeys, ...todayBookingKeys]);
   // Resolve canonical display names: pricing wins over booking raw name
   const resolveCanonical = (key) => pricingMap.get(key)?.canonicalName ?? bookingCanonicalMap.get(key) ?? key;
   let activeProjects = [...activeKeySet].sort().map((key) => ({ key, name: resolveCanonical(key) }));
@@ -605,9 +623,57 @@ function listDueImageDigestSlots(now = new Date()) {
     .map((hour) => ({ dateStr: current.dateStr, hour, slotKey: `${current.dateStr}@${String(hour).padStart(2, "0")}` }));
 }
 
+function maskLineTarget(target) {
+  const raw = String(target ?? "");
+  if (raw.length <= 10) return raw || "-";
+  return `${raw.slice(0, 6)}...${raw.slice(-4)}`;
+}
+
+async function discoverBookingDigestTargets(slot, todayRange) {
+  const targets = new Set();
+  const addTarget = (value) => {
+    const target = normalizeSpaces(value);
+    if (target && target !== "direct") targets.add(target);
+  };
+
+  if (todayRange) {
+    const { data: todayBookings, error: todayError } = await supabase
+      .from("line_booking_records")
+      .select("group_id")
+      .eq("booking_status", "booked")
+      .not("group_id", "is", null)
+      .gte("booked_at", todayRange.startIso)
+      .lt("booked_at", todayRange.endIso);
+    if (todayError) console.error("[digest] discover today bookings failed:", todayError);
+    for (const row of todayBookings ?? []) addTarget(row.group_id);
+    console.log(
+      `[digest] discover slot=${slot.slotKey} source=today_bookings rows=${todayBookings?.length ?? 0} targets=${targets.size}`,
+    );
+  }
+
+  const { data: activeProjects, error: activeError } = await supabase
+    .from("line_project_pricing")
+    .select("group_id")
+    .not("group_id", "is", null)
+    .gte("event_end_date", slot.dateStr);
+  if (activeError) console.error("[digest] discover active projects failed:", activeError);
+  for (const row of activeProjects ?? []) addTarget(row.group_id);
+  console.log(
+    `[digest] discover slot=${slot.slotKey} source=active_projects rows=${activeProjects?.length ?? 0} targets=${targets.size}`,
+  );
+
+  return targets;
+}
+
 async function flushImageDigestSlot(slot) {
   const state = readImageDigestState();
-  if (state.sentSlots?.[slot.slotKey]) return;
+  if (state.sentSlots?.[slot.slotKey]) {
+    console.log(`[digest] slot=${slot.slotKey} skipped=already_sent sentAt=${state.sentSlots[slot.slotKey]}`);
+    return;
+  }
+  console.log(
+    `[digest] slot=${slot.slotKey} start enabled=${LINE_IMAGE_SUMMARY_ENABLED} hours=${LINE_IMAGE_SUMMARY_HOURS.join(",")} stateEvents=${state.events?.length ?? 0}`,
+  );
 
   // Collect events from today (Bangkok date) — both pending and already sent in earlier slots today
   const todayRange = getDailyRangeUtc(slot.dateStr);
@@ -627,10 +693,19 @@ async function flushImageDigestSlot(slot) {
     list.push(item);
     grouped.set(item.pushTarget, list);
   }
+  const queuedTargetCount = grouped.size;
+
+  for (const target of await discoverBookingDigestTargets(slot, todayRange)) {
+    if (!grouped.has(target)) grouped.set(target, []);
+  }
+  console.log(
+    `[digest] slot=${slot.slotKey} targets queued=${queuedTargetCount} total=${grouped.size} todayEvents=${todayEvents.length}`,
+  );
 
   if (!grouped.size) {
     state.sentSlots[slot.slotKey] = new Date().toISOString();
     writeImageDigestState(state);
+    console.log(`[digest] slot=${slot.slotKey} finished=no_targets mark_sent=true`);
     return;
   }
 
@@ -645,10 +720,18 @@ async function flushImageDigestSlot(slot) {
     const groupId = items.find((i) => i?.groupId)?.groupId ?? target;
     const reviewItems = items.filter((i) => i?.status !== "saved");
     const msgs = await buildBookingDigestMessage(slot, groupId, reviewItems);
+    console.log(
+      `[digest] slot=${slot.slotKey} target=${maskLineTarget(target)} group=${maskLineTarget(groupId)} events=${items.length} review=${reviewItems.length} msgs=${msgs?.length ?? 0}`,
+    );
     if (!msgs?.length) continue;
     let ok = true;
     for (let i = 0; i < msgs.length; i += 5) {
-      if (!(await pushMessage(target, msgs.slice(i, i + 5)))) { ok = false; break; }
+      const chunk = msgs.slice(i, i + 5);
+      const pushed = await pushMessage(target, chunk);
+      console.log(
+        `[digest] slot=${slot.slotKey} target=${maskLineTarget(target)} push chunk=${Math.floor(i / 5) + 1}/${Math.ceil(msgs.length / 5)} messages=${chunk.length} ok=${pushed}`,
+      );
+      if (!pushed) { ok = false; break; }
     }
     if (!ok) continue;
     anyPushed = true;
@@ -657,7 +740,10 @@ async function flushImageDigestSlot(slot) {
     }
   }
 
-  if (!anyPushed) return;
+  if (!anyPushed) {
+    console.log(`[digest] slot=${slot.slotKey} finished=no_successful_push mark_sent=false`);
+    return;
+  }
   const sentAt = new Date().toISOString();
   if (sentIds.size) {
     state.events = (state.events ?? []).map((item) =>
@@ -666,6 +752,7 @@ async function flushImageDigestSlot(slot) {
   }
   state.sentSlots[slot.slotKey] = sentAt;
   writeImageDigestState(state);
+  console.log(`[digest] slot=${slot.slotKey} finished=sent targets=${grouped.size} sentEvents=${sentIds.size} sentAt=${sentAt}`);
 }
 
 let imageDigestSchedulerStarted = false;
@@ -710,6 +797,14 @@ async function upsertGroupDefaultProject(groupId, projectName) {
   );
 }
 
+const BOOKING_EVENT_DATE_LABELS = [
+  "\u0e27\u0e31\u0e19\u0e17\u0e35\u0e48\u0e08\u0e31\u0e14\u0e07\u0e32\u0e19",
+  "\u0e27\u0e31\u0e19\u0e08\u0e31\u0e14\u0e07\u0e32\u0e19",
+  "\u0e27\u0e31\u0e19\u0e17\u0e35\u0e48\u0e07\u0e32\u0e19",
+  "event date",
+  "date",
+];
+
 // Extract date ranges like 29/04, 8/05, 29/04-8/05 from a string
 function extractDatesFromText(text) {
   const dates = [];
@@ -753,6 +848,85 @@ function extractDatesFromText(text) {
     }
   }
   return dates;
+}
+
+function toGregorianYear(value) {
+  const year = Number(value);
+  if (!Number.isInteger(year)) return null;
+  if (year >= 2400 && year <= 2700) return year - 543;
+  if (year >= 2000 && year <= 2100) return year;
+  return null;
+}
+
+function formatIsoDate(year, month, day) {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return "";
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    return "";
+  }
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function extractEventYearFromText(text) {
+  const raw = normalizeSpaces(toAsciiDigits(String(text ?? "")));
+  if (!raw) return null;
+  const matched = raw.match(/\b(25\d{2}|20\d{2})\b/);
+  return matched ? toGregorianYear(matched[1]) : null;
+}
+
+function extractEventDateRange(text) {
+  const raw = normalizeSpaces(toAsciiDigits(String(text ?? "")));
+  if (!raw) return { eventStartDate: "", eventEndDate: "" };
+
+  const explicitIsoDates = [];
+  for (const match of raw.matchAll(/\b(20\d{2}|25\d{2})-(\d{1,2})-(\d{1,2})\b/g)) {
+    const year = toGregorianYear(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const iso = formatIsoDate(year, month, day);
+    if (iso) explicitIsoDates.push(iso);
+  }
+  if (explicitIsoDates.length) {
+    return {
+      eventStartDate: explicitIsoDates[0],
+      eventEndDate: explicitIsoDates[explicitIsoDates.length - 1],
+    };
+  }
+
+  const explicitSlashDates = [];
+  for (const match of raw.matchAll(/\b(\d{1,2})[\/-](\d{1,2})[\/-](20\d{2}|25\d{2})\b/g)) {
+    const day = Number(match[1]);
+    const month = Number(match[2]);
+    const year = toGregorianYear(match[3]);
+    const iso = formatIsoDate(year, month, day);
+    if (iso) explicitSlashDates.push(iso);
+  }
+  if (explicitSlashDates.length) {
+    return {
+      eventStartDate: explicitSlashDates[0],
+      eventEndDate: explicitSlashDates[explicitSlashDates.length - 1],
+    };
+  }
+
+  const dates = extractDatesFromText(raw);
+  const year = extractEventYearFromText(raw);
+  if (!dates.length || !year) return { eventStartDate: "", eventEndDate: "" };
+
+  const start = dates[0];
+  const end = dates[dates.length - 1];
+  let endYear = year;
+  if (end.month < start.month || (end.month === start.month && end.day < start.day)) {
+    endYear += 1;
+  }
+
+  return {
+    eventStartDate: formatIsoDate(year, start.month, start.day),
+    eventEndDate: formatIsoDate(endYear, end.month, end.day),
+  };
 }
 
 function dateOverlapsProject(sheetDates, proj) {
@@ -885,6 +1059,74 @@ async function getProjectEventDates(groupId, projectName) {
     eventEndDate: data?.event_end_date ?? null,
     error: null,
   };
+}
+
+async function ensureProjectPricingFromBooking(parsed, source) {
+  const groupId = source?.groupId ?? source?.roomId ?? null;
+  const projectName = normalizeSpaces(parsed?.projectName);
+  const eventStartDate = normalizeSpaces(parsed?.eventStartDate);
+  const eventEndDate = normalizeSpaces(parsed?.eventEndDate) || eventStartDate;
+  if (!groupId || !projectName || !/^\d{4}-\d{2}-\d{2}$/.test(eventStartDate)) {
+    return { ok: true, skipped: true };
+  }
+
+  const todayStr = getTimePartsInTz(new Date()).dateStr;
+  if (eventEndDate && eventEndDate < todayStr) return { ok: true, skipped: true };
+
+  const normalizedBoothPrice = normalizeAmount(parsed?.boothPrice) ?? 0;
+  const { data: existing, error: readError } = await supabase
+    .from("line_project_pricing")
+    .select("project_name, event_start_date, event_end_date, booth_price")
+    .eq("group_id", groupId)
+    .eq("project_name", projectName)
+    .maybeSingle();
+
+  if (readError) {
+    console.error("[project-auto-create] read failed:", readError);
+    return { ok: false, error: readError };
+  }
+
+  if (!existing) {
+    const { error: insertError } = await supabase
+      .from("line_project_pricing")
+      .insert({
+        group_id: groupId,
+        project_name: projectName,
+        booth_price: normalizedBoothPrice,
+        event_start_date: eventStartDate,
+        event_end_date: eventEndDate,
+        updated_at: new Date().toISOString(),
+      });
+    if (insertError) {
+      console.error("[project-auto-create] insert failed:", insertError);
+      return { ok: false, error: insertError };
+    }
+    console.log(`[project-auto-create] created project="${projectName}" start=${eventStartDate} end=${eventEndDate}`);
+    return { ok: true, created: true };
+  }
+
+  const updatePayload = {};
+  if (!existing.event_start_date) updatePayload.event_start_date = eventStartDate;
+  if (!existing.event_end_date) updatePayload.event_end_date = eventEndDate;
+  if (existing.booth_price === null && normalizedBoothPrice > 0) {
+    updatePayload.booth_price = normalizedBoothPrice;
+  }
+  if (!Object.keys(updatePayload).length) return { ok: true, skipped: true };
+
+  updatePayload.updated_at = new Date().toISOString();
+  const { error: updateError } = await supabase
+    .from("line_project_pricing")
+    .update(updatePayload)
+    .eq("group_id", groupId)
+    .eq("project_name", projectName);
+  if (updateError) {
+    console.error("[project-auto-create] update failed:", updateError);
+    return { ok: false, error: updateError };
+  }
+  console.log(
+    `[project-auto-create] updated project="${projectName}" start=${updatePayload.event_start_date ?? existing.event_start_date} end=${updatePayload.event_end_date ?? existing.event_end_date}`,
+  );
+  return { ok: true, updated: true };
 }
 
 const helpText = [
@@ -1234,6 +1476,30 @@ function hasRequiredBookingFields(parsed) {
   return Boolean(parsed.projectName && parsed.shopName);
 }
 
+const PLACEHOLDER_SHOP_KEYS = new Set([
+  "\u0e0a\u0e37\u0e48\u0e2d\u0e23\u0e49\u0e32\u0e19",
+  "\u0e23\u0e49\u0e32\u0e19",
+  "shop",
+  "shopname",
+  "shop_name",
+].map(normalizeKey));
+
+const PLACEHOLDER_BOOTH_KEYS = new Set([
+  "\u0e1a\u0e39\u0e18",
+  "\u0e1a\u0e39\u0e17",
+  "\u0e40\u0e25\u0e02\u0e1a\u0e39\u0e18",
+  "\u0e40\u0e25\u0e02\u0e1a\u0e39\u0e17",
+  "booth",
+  "boothcode",
+  "booth_code",
+].map(normalizeKey));
+
+function isPlaceholderBookingRow(parsed) {
+  const shopKey = normalizeKey(parsed?.shopName);
+  const boothKey = normalizeKey(parsed?.boothCode);
+  return PLACEHOLDER_SHOP_KEYS.has(shopKey) || PLACEHOLDER_BOOTH_KEYS.has(boothKey);
+}
+
 function normalizeAmount(value) {
   const raw = toAsciiDigits(String(value ?? "")).replace(/,/g, "").trim();
   if (!raw) return null;
@@ -1361,12 +1627,16 @@ async function parseBookingCommand(text, groupId) {
   const shopName = pickValue(kv, ["ร้าน", "shop", "shop_name"]);
   const phones = extractPhones(pickValue(kv, ["เบอร์", "โทร", "phone"]));
   const phone = pickPrimaryPhone(phones);
+  const eventDateText = normalizeSpaces(
+    pickValue(kv, ["วันที่จัดงาน", "วันจัดงาน", "วันที่งาน", "event_date", "event date", "date"]),
+  );
   const boothCode = pickValue(kv, ["บูธ", "บูท", "booth", "booth_code"]);
   const productType = pickValue(kv, ["ประเภท", "สินค้า", "category"]);
   const note = pickValue(kv, ["หมายเหตุ", "note"]);
   const boothPrice = normalizeAmount(
     pickValue(kv, ["ราคา", "ค่าบูธ", "ค่าเช่า", "price", "booth_price"]),
   );
+  const { eventStartDate, eventEndDate } = extractEventDateRange(eventDateText);
 
   const equipment = parseEquipmentFields({
     tableFree: pickValue(kv, ["โต๊ะฟรี", "table_free", "table_free_qty"]),
@@ -1383,6 +1653,8 @@ async function parseBookingCommand(text, groupId) {
     boothCode: normalizeBoothCode(boothCode),
     productType: normalizeSpaces(productType),
     note: normalizeSpaces(note),
+    eventStartDate,
+    eventEndDate,
     boothPrice,
     tableFreeQty: equipment.tableFreeQty,
     tableExtraQty: equipment.tableExtraQty,
@@ -1470,10 +1742,12 @@ async function parseBookingFormText(text, groupId) {
     pickByLabel(fields, ["ช่องทางการจำหน่าย", "ig", "instagram", "facebook", "line"]),
   );
   const additionalRemark = normalizeSpaces(pickByLabel(fields, ["หมายเหตุ", "note"]));
+  const eventDateText = normalizeSpaces(pickByLabel(fields, BOOKING_EVENT_DATE_LABELS));
   const boothPriceRaw = normalizeSpaces(
     pickByLabel(fields, ["ราคาบูธ", "ราคา", "ค่าบูธ", "ค่าเช่า", "ค่าพื้นที่", "price", "booth price"]),
   );
   const boothPrice = normalizeAmount(boothPriceRaw);
+  const { eventStartDate, eventEndDate } = extractEventDateRange(eventDateText);
 
   const equipment = parseEquipmentFields({
     tableFree,
@@ -1509,6 +1783,8 @@ async function parseBookingFormText(text, groupId) {
     boothCode: normalizeBoothCode(boothCode),
     productType,
     note: normalizeSpaces(noteParts.join(" | ")).slice(0, 1800),
+    eventStartDate,
+    eventEndDate,
     boothPrice,
     tableFreeQty: equipment.tableFreeQty,
     tableExtraQty: equipment.tableExtraQty,
@@ -1604,15 +1880,30 @@ function clearPendingProjectSelection(source) {
   pendingProjectSelectionByActor.delete(getActorKeyFromSource(source));
 }
 
-async function findActiveBoothConflict(source, projectName, boothCode) {
+async function findActiveBoothConflict(source, projectName, boothCode, options = {}) {
   const groupId = getGroupIdFromSource(source);
   const normalizedBooth = normalizeBoothCode(boothCode);
   if (!projectName || !normalizedBooth) return { data: null, error: null };
 
+  let eventStartDate = normalizeSpaces(options?.eventStartDate);
+  let eventEndDate = normalizeSpaces(options?.eventEndDate);
+  if (!eventStartDate || !eventEndDate) {
+    const { eventStartDate: dbStartDate, eventEndDate: dbEndDate, error: dateError } = await getProjectEventDates(
+      groupId,
+      projectName,
+    );
+    if (dateError) return { data: null, error: dateError };
+    if (!eventStartDate) eventStartDate = dbStartDate ?? "";
+    if (!eventEndDate) eventEndDate = dbEndDate ?? "";
+  }
+
+  const todayStr = getTimePartsInTz(new Date()).dateStr;
+  if (eventEndDate && todayStr > eventEndDate) return { data: null, error: null };
+
   // Search both the actual group_id and "direct" to catch records saved from different contexts
   const groupIds = groupId === "direct" ? ["direct"] : [groupId, "direct"];
 
-  const { data, error } = await supabase
+  let conflictQuery = supabase
     .from("line_booking_records")
     .select("id, project_name, shop_name, phone, booth_code, booked_at")
     .in("group_id", groupIds)
@@ -1620,6 +1911,14 @@ async function findActiveBoothConflict(source, projectName, boothCode) {
     .eq("booking_status", "booked")
     .order("booked_at", { ascending: false })
     .limit(500);
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(eventStartDate)) {
+    const windowStart = new Date(`${eventStartDate}T00:00:00.000Z`);
+    windowStart.setUTCDate(windowStart.getUTCDate() - BOOKING_CONFLICT_LOOKBACK_DAYS);
+    conflictQuery = conflictQuery.gte("booked_at", windowStart.toISOString());
+  }
+
+  const { data, error } = await conflictQuery;
 
   if (error) return { data: null, error };
 
@@ -1705,6 +2004,13 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
     };
   }
 
+  if (isPlaceholderBookingRow(normalized)) {
+    console.log(
+      `[booking] rejected placeholder row: shop="${normalized.shopName}" booth="${normalized.boothCode}"`,
+    );
+    return { ok: false, silent: true, message: "" };
+  }
+
   // Reject numeric-only shop names (Excel import artifact)
   if (/^\d+$/.test((normalized.shopName ?? "").trim())) {
     console.log(`[booking] rejected numeric shop_name: "${normalized.shopName}"`);
@@ -1727,12 +2033,19 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
 
   // Reject booking if the event has already ended (skip for Excel import)
   if (effectiveBooking.projectName && !options.allowPastEvents) {
+    const todayStr = getTimePartsInTz(new Date()).dateStr;
+    if (parsed?.eventEndDate && todayStr > parsed.eventEndDate) {
+      console.log(
+        `[booking] skipped — parsed event ended ${parsed.eventEndDate} (project: ${effectiveBooking.projectName})`,
+      );
+      return { ok: false, silent: true, message: "" };
+    }
+
     const { eventEndDate, error: dateError } = await getProjectEventDates(
       getGroupIdFromSource(source),
       effectiveBooking.projectName,
     );
     if (!dateError && eventEndDate) {
-      const todayStr = getTimePartsInTz(new Date()).dateStr;
       if (todayStr > eventEndDate) {
         console.log(`[booking] skipped — event ended ${eventEndDate} (project: ${effectiveBooking.projectName})`);
         return { ok: false, silent: true, message: "" };
@@ -1759,6 +2072,10 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
       source,
       effectiveBooking.projectName,
       effectiveBooking.boothCode,
+      {
+        eventStartDate: parsed?.eventStartDate,
+        eventEndDate: parsed?.eventEndDate,
+      },
     );
 
     if (conflictError) {
@@ -1822,6 +2139,17 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
   }
 
   clearPendingReplacement(source);
+  const projectSync = await ensureProjectPricingFromBooking(
+    {
+      ...parsed,
+      projectName: effectiveBooking.projectName,
+      boothPrice: effectiveBooking.boothPrice,
+    },
+    source,
+  );
+  if (!projectSync?.ok) {
+    console.error("[project-auto-create] sync failed after booking save", projectSync?.error ?? "");
+  }
   let message = formatSavedBookingMessage(data, effectiveBooking.note);
   if (replacedConflict) {
     message += `\nReplaced old booking #${shortId(replacedConflict.id)} (${replacedConflict.shop_name})`;
@@ -2968,8 +3296,10 @@ async function tryAutoBookingText(text, source, messageId, lineEvent = null) {
       }
     }
     if (!hasRequiredBookingFields(aiParsed)) return null;
+    const aiSaveResult = await saveBookingWithAgentRules(aiParsed, source, messageId);
+    console.log(`[text] ai:saveResult ok=${aiSaveResult.ok} silent=${aiSaveResult.silent ?? false} project=${aiParsed.projectName ?? "-"} shop=${aiParsed.shopName ?? "-"}`);
     const pushTarget = getImageDigestPushTarget(source ?? {});
-    if (pushTarget) {
+    if (aiSaveResult.ok && pushTarget) {
       queueImageDigestEvent({
         pushTarget,
         groupId: getGroupIdFromSource(source),
@@ -2989,8 +3319,6 @@ async function tryAutoBookingText(text, source, messageId, lineEvent = null) {
       });
       startImageDigestScheduler();
     }
-    const aiSaveResult = await saveBookingWithAgentRules(aiParsed, source, messageId);
-    console.log(`[text] ai:saveResult ok=${aiSaveResult.ok} silent=${aiSaveResult.silent ?? false} project=${aiParsed.projectName ?? "-"} shop=${aiParsed.shopName ?? "-"}`);
     // In 1:1 chat reply directly since there is no group digest
     if (!source?.groupId && !source?.roomId) {
       return aiSaveResult.message ?? (aiSaveResult.ok ? `✅ บันทึกแล้ว: ${aiParsed.shopName ?? ""} บูธ ${aiParsed.boothCode ?? "-"} (${aiParsed.projectName ?? "-"})` : null);
@@ -5155,10 +5483,12 @@ async function handleFileMessage(event) {
   // Fetch known projects (with dates) for this group to help Nova match sheet → project
   let knownProjects = [];
   if (groupId) {
+    const todayStr = getTimePartsInTz(new Date()).dateStr;
     const { data: pData } = await supabase
       .from("line_project_pricing")
       .select("project_name, event_start_date, event_end_date")
-      .eq("group_id", groupId);
+      .eq("group_id", groupId)
+      .gte("event_end_date", todayStr);
     knownProjects = (pData ?? [])
       .filter((p) => p.project_name)
       .map((p) => ({ name: p.project_name, startDate: p.event_start_date, endDate: p.event_end_date }));
@@ -5274,7 +5604,7 @@ async function handleFileMessage(event) {
   let saved = 0, duplicates = 0, errors = 0;
   for (const row of excelRows) {
     if (!row.projectName) { errors++; continue; }
-    const result = await saveBookingWithAgentRules(row, source, messageId, { allowPastEvents: true, forceReplace: true });
+    const result = await saveBookingWithAgentRules(row, source, messageId, { forceReplace: true });
     if (result.ok) saved++;
     else if (result.needsConfirmation) {
       duplicates++;
