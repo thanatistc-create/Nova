@@ -617,6 +617,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
 }
 
 function listDueImageDigestSlots(now = new Date()) {
+  if (!LINE_IMAGE_SUMMARY_ENABLED) return [];
   const current = getTimePartsInTz(now);
   return LINE_IMAGE_SUMMARY_HOURS
     .filter((hour) => current.hour >= hour)
@@ -757,7 +758,7 @@ async function flushImageDigestSlot(slot) {
 
 let imageDigestSchedulerStarted = false;
 function startImageDigestScheduler() {
-  if (imageDigestSchedulerStarted || (!LINE_IMAGE_SUMMARY_ENABLED && !LINE_AI_TEXT_FALLBACK_ENABLED)) return;
+  if (imageDigestSchedulerStarted || !LINE_IMAGE_SUMMARY_ENABLED) return;
   imageDigestSchedulerStarted = true;
   const run = async () => {
     try {
