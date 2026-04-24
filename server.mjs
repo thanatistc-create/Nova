@@ -1522,6 +1522,18 @@ function isPlaceholderBookingRow(parsed) {
   return PLACEHOLDER_SHOP_KEYS.has(shopKey) || PLACEHOLDER_BOOTH_KEYS.has(boothKey);
 }
 
+function isVacancyShopName(value) {
+  const key = normalizeKey(value);
+  return key === "\u0e27\u0e48\u0e32\u0e07" || key.startsWith("\u0e27\u0e48\u0e32\u0e07");
+}
+
+function isImportArtifactShopName(value) {
+  const raw = normalizeSpaces(value);
+  if (!raw) return true;
+  if (/^\d+$/.test(raw)) return true;
+  return isVacancyShopName(raw);
+}
+
 function normalizeAmount(value) {
   const raw = toAsciiDigits(String(value ?? "")).replace(/,/g, "").trim();
   if (!raw) return null;
@@ -2034,8 +2046,8 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
   }
 
   // Reject numeric-only shop names (Excel import artifact)
-  if (/^\d+$/.test((normalized.shopName ?? "").trim())) {
-    console.log(`[booking] rejected numeric shop_name: "${normalized.shopName}"`);
+  if (isImportArtifactShopName(normalized.shopName)) {
+    console.log(`[booking] rejected import artifact shop_name: "${normalized.shopName}"`);
     return { ok: false, silent: true, message: "" };
   }
 
@@ -5610,7 +5622,9 @@ async function handleFileMessage(event) {
         const phone = pick("phone", "เบอร์โทร", "เบอร์", "Phone");
         const note = pick("note", "หมายเหตุ", "Note");
         const isSummaryRow = /^(total|รวม|ผลรวม|สรุป|summary|sub\s*total|grand\s*total|ทั้งหมด)$/i.test(shopName);
-        if (boothCode && shopName && !isSummaryRow) excelRows.push({ boothCode, shopName, projectName, phone, note });
+        if (boothCode && shopName && !isSummaryRow && !isImportArtifactShopName(shopName)) {
+          excelRows.push({ boothCode, shopName, projectName, phone, note });
+        }
       }
     }
   }
