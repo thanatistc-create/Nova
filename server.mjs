@@ -56,6 +56,7 @@ const LINE_IMAGE_SUMMARY_ENABLED =
   String(process.env.LINE_IMAGE_SUMMARY_ENABLED ?? (LINE_IMAGE_GROUP_REPLY_MODE === "digest" ? "true" : "false")).toLowerCase() !== "false";
 const LINE_IMAGE_SUMMARY_HOURS = parseDigestHours(process.env.LINE_IMAGE_SUMMARY_HOURS ?? "17");
 const LINE_IMAGE_SUMMARY_MAX_ITEMS = normalizeDigestMaxItems(process.env.LINE_IMAGE_SUMMARY_MAX_ITEMS, 8);
+const LINE_DIRECT_DEFAULT_GROUP_ID = (process.env.LINE_DIRECT_DEFAULT_GROUP_ID ?? "C4d1c5fae34484d0e6af8c47b7478e6f7").trim();
 const IMAGE_DIGEST_STATE_FILE = path.join(__dirname, ".line-image-digest.json");
 const LINE_AI_TEXT_FALLBACK_ENABLED =
   String(process.env.LINE_AI_TEXT_FALLBACK_ENABLED ?? "true").toLowerCase() !== "false" &&
@@ -245,6 +246,10 @@ async function pushMessage(target, messages) {
 
 function getImageDigestPushTarget(source) {
   return source?.groupId ?? source?.roomId ?? "";
+}
+
+function getReportGroupIdFromSource(source) {
+  return source?.groupId ?? source?.roomId ?? LINE_DIRECT_DEFAULT_GROUP_ID ?? null;
 }
 
 function shouldSuppressImmediateImageReply(event) {
@@ -5081,8 +5086,8 @@ async function handleTextMessage(event) {
 
   if (/^\/สรุป(?:\s|$)/.test(normalized) || /^\/report(?:\s|$)/i.test(normalized)) {
     const { dateStr, hour } = getTimePartsInTz(new Date());
-    // In 1:1 chat there is no groupId — pass null to get all-group summary
-    const groupId = source?.groupId ?? source?.roomId ?? null;
+    // In 1:1 chat, use the configured default group so private reports match the main group.
+    const groupId = getReportGroupIdFromSource(source);
     const pushTarget = source?.groupId ?? source?.roomId ?? source?.userId;
     const projectFilter = normalized.replace(/^\/สรุป\s*/i, "").replace(/^\/report\s*/i, "").trim();
     const msgs = await buildBookingDigestMessage({ dateStr, hour }, groupId, [], projectFilter);
