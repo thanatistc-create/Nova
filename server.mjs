@@ -976,15 +976,15 @@ function scoreSheetVsProject(sheetName, proj) {
   return matches / projTokens.length;
 }
 
-async function resolveProjectFromSheetName(sheetName, groupId, defaultProject) {
-  if (!sheetName || !groupId) return sheetName || defaultProject || "";
+async function resolveProjectFromSheetName(sheetName, groupId) {
+  if (!sheetName || !groupId) return "";
 
   const { data: projects } = await supabase
     .from("line_project_pricing")
     .select("project_name, event_start_date, event_end_date")
     .eq("group_id", groupId);
 
-  if (!projects?.length) return defaultProject || sheetName;
+  if (!projects?.length) return "";
 
   const sheetDates = extractDatesFromText(sheetName);
 
@@ -995,10 +995,10 @@ async function resolveProjectFromSheetName(sheetName, groupId, defaultProject) {
     return { proj, score: textScore + dateBonus };
   }).filter((x) => x.score > 0).sort((a, b) => b.score - a.score);
 
-  if (scored.length === 0) return defaultProject || sheetName;
+  if (scored.length === 0) return "";
   // Use best match if score is reasonable (at least one meaningful token matches)
   if (scored[0].score >= 0.3) return scored[0].proj.project_name;
-  return defaultProject || sheetName;
+  return "";
 }
 
 async function getGroupDefaultProject(groupId) {
@@ -1656,8 +1656,7 @@ function hasRequiredExpenseFields(parsed) {
 async function parseBookingCommand(text, groupId) {
   const kv = parseKvSegments(text);
   const projectName =
-    pickValue(kv, ["โปรเจกต์", "โปรเจค", "project"]) ||
-    (await getGroupDefaultProject(groupId));
+    pickValue(kv, ["โปรเจกต์", "โปรเจค", "project"]);
   const shopName = pickValue(kv, ["ร้าน", "shop", "shop_name"]);
   const phones = extractPhones(pickValue(kv, ["เบอร์", "โทร", "phone"]));
   const phone = pickPrimaryPhone(phones);
@@ -1712,7 +1711,7 @@ async function parseBookingFormText(text, groupId) {
       "โปรเจกต์",
       "โปรเจค",
       "project",
-    ]) || (await getGroupDefaultProject(groupId));
+    ]);
 
   const shopName = pickByLabel(fields, ["ชื่อร้าน", "ร้าน", "shop", "shop name"]);
 
@@ -2011,6 +2010,8 @@ function normalizeParsedBooking(parsed) {
     boothCode: normalizeBoothCode(parsed?.boothCode),
     productType: normalizeSpaces(parsed?.productType),
     note: normalizeSpaces(parsed?.note).slice(0, 1800),
+    eventStartDate: normalizeSpaces(parsed?.eventStartDate),
+    eventEndDate: normalizeSpaces(parsed?.eventEndDate),
     boothPrice: normalizeAmount(parsed?.boothPrice),
     tableFreeQty: equipment.tableFreeQty,
     tableExtraQty: equipment.tableExtraQty,
@@ -2293,6 +2294,8 @@ async function insertBookingRecord(parsed, source, messageId) {
     booking_status: "booked",
     source_user_id: source.userId ?? null,
     source_message_id: messageId ?? null,
+    event_start_date: parsed.eventStartDate || null,
+    event_end_date: parsed.eventEndDate || null,
   };
 
   const withPriceResult = await supabase
@@ -2948,19 +2951,7 @@ function commandAgentStatus() {
 }
 
 async function commandSetProject(text, source) {
-  const projectName = normalizeSpaces(
-    text.replace(/^\/(?:ผูกโปรเจกต์|bind-project|bind)\s*/i, ""),
-  );
-  if (!projectName) {
-    return "Please provide project name, e.g. /bind-project Craft Corner March 2026";
-  }
-  const groupId = getGroupIdFromSource(source);
-  const { error } = await upsertGroupDefaultProject(groupId, projectName);
-  if (error) {
-    console.error(error);
-    return "Set default project failed. Please try again.";
-  }
-  return `Default project set to: ${projectName}`;
+  return "Default project is disabled. Please include project/event name in each booking or import file.";
 }
 
 async function commandSetBoothPrice(text, source) {
@@ -2970,10 +2961,6 @@ async function commandSetBoothPrice(text, source) {
   let projectName = normalizeSpaces(
     pickValue(kv, ["โปรเจกต์", "โปรเจค", "project"]),
   );
-
-  if (!projectName) {
-    projectName = await getGroupDefaultProject(groupId);
-  }
 
   const price =
     normalizeAmount(
@@ -3004,7 +2991,6 @@ async function commandSetEvent(text, source) {
   const kv = parseKvSegments(text);
 
   let projectName = normalizeSpaces(pickValue(kv, ["project", "โปรเจกต์", "โปรเจค"]));
-  if (!projectName) projectName = await getGroupDefaultProject(groupId);
   if (!projectName) return "ระบุชื่องาน: /set-event project=<ชื่อ> start=YYYY-MM-DD end=YYYY-MM-DD [notify=3]";
 
   const startRaw = pickValue(kv, ["start", "start_date", "วันเริ่ม"]);
@@ -3324,8 +3310,7 @@ async function tryAutoBookingText(text, source, messageId, lineEvent = null) {
           const projectList = activeProjects.map((p, i) => `${i + 1}. ${p}`).join("\n");
           return `📋 ข้อมูลร้าน: ${aiParsed.shopName || "?"}\nกรุณาพิมพ์ชื่อโปรเจกต์ที่ต้องการจอง:\n${projectList}`;
         } else {
-          const def = await getGroupDefaultProject(gid);
-          if (def) aiParsed.projectName = def;
+          insertPendingProjectRecord(aiParsed, source, messageId).catch(console.error);
         }
       }
     }
@@ -4908,12 +4893,7 @@ async function commandBookingFromImage(event) {
           digestEvent: buildImageDigestEvent(event, { category: "booking", status: "needs_review", reason: "needs_project_selection", sourceTag: "image_ai", shopName: parsed.shopName, boothCode: parsed.boothCode }),
         };
       } else {
-        // No active projects found — fall back to group default project
-        const groupId2 = getGroupIdFromSource(source);
-        if (groupId2) {
-          const def = await getGroupDefaultProject(groupId2);
-          if (def) parsed.projectName = def;
-        }
+        insertPendingProjectRecord(parsed, source, messageId).catch(console.error);
       }
     }
     if (hasRequiredBookingFields(parsed)) {
@@ -5446,9 +5426,7 @@ async function handlePdfMessage(event) {
   if (classification === "booking") {
     const parsed = buildBookingFromAiAnalysis(analysis, "");
     if (!parsed.projectName) {
-      const gid = getGroupIdFromSource(source);
-      const def = await getGroupDefaultProject(gid);
-      if (def) parsed.projectName = def;
+      insertPendingProjectRecord(parsed, source, messageId).catch(console.error);
     }
     if (!hasRequiredBookingFields(parsed)) {
       console.warn("[file] pdf: missing required booking fields");
@@ -5570,13 +5548,21 @@ async function handleFileMessage(event) {
           projectName: normalizeSpaces(String(r.projectName ?? "")),
           phone,
           note: normalizeSpaces(String(r.note ?? "")),
+          eventStartDate: normalizeSpaces(String(r.eventStartDate ?? r.event_start_date ?? "")),
+          eventEndDate: normalizeSpaces(String(r.eventEndDate ?? r.event_end_date ?? "")),
           tableFreeQty,
           chairFreeQty,
           powerLabel: pwLabel !== "-" ? pwLabel : "",
         };
       })
-      .filter((r) => r.shopName && r.projectName);
-  } else {
+      .filter((r) => r.shopName && r.projectName && (r.eventStartDate || r.eventEndDate));
+    if (!excelRows.length) {
+      console.warn("[file] nova:excel rows missing project dates — falling back to local XLSX parser");
+      excelRows = null;
+    }
+  }
+
+  if (!excelRows?.length) {
     // ── Fallback: local XLSX parsing ──────────────────────────────────────────
     let xlsxMod;
     try {
@@ -5594,10 +5580,9 @@ async function handleFileMessage(event) {
       return;
     }
 
-    const defaultProject = await getGroupDefaultProject(groupId);
     const sheetProjectMap = {};
     for (const sheetName of workbook.SheetNames) {
-      sheetProjectMap[sheetName] = await resolveProjectFromSheetName(sheetName, groupId, defaultProject);
+      sheetProjectMap[sheetName] = await resolveProjectFromSheetName(sheetName, groupId);
       console.log(`[file] xlsx:sheet="${sheetName}" → project="${sheetProjectMap[sheetName]}"`);
     }
 
@@ -5618,7 +5603,7 @@ async function handleFileMessage(event) {
         const rawShop = pick("shop_name", "ชื่อร้าน", "ร้าน", "Shop", "SHOP");
         if (rawShop) lastShopName = rawShop;
         const shopName = lastShopName;
-        const projectName = sheetProjectMap[sheetName] || defaultProject || "";
+        const projectName = sheetProjectMap[sheetName] || "";
         const phone = pick("phone", "เบอร์โทร", "เบอร์", "Phone");
         const note = pick("note", "หมายเหตุ", "Note");
         const isSummaryRow = /^(total|รวม|ผลรวม|สรุป|summary|sub\s*total|grand\s*total|ทั้งหมด)$/i.test(shopName);
