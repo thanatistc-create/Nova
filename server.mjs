@@ -35,6 +35,10 @@ const SUPABASE_URL = process.env.SUPABASE_URL ?? process.env.VITE_SUPABASE_URL ?
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
 const LINE_PUBLIC_BASE_URL = (process.env.LINE_PUBLIC_BASE_URL ?? "").trim().replace(/\/+$/, "");
 const LINE_EXPORT_TOKEN = (process.env.LINE_EXPORT_TOKEN ?? "").trim();
+const LINE_BOT_SELF_TEST = String(process.env.LINE_BOT_SELF_TEST ?? "").toLowerCase() === "1" ||
+  String(process.env.LINE_BOT_SELF_TEST ?? "").toLowerCase() === "true";
+const LINE_TEXT_AI_MIN_CHARS = Math.max(120, Number(process.env.LINE_TEXT_AI_MIN_CHARS ?? 180) || 180);
+const LINE_TEXT_AI_MAX_CHARS = Math.max(LINE_TEXT_AI_MIN_CHARS, Number(process.env.LINE_TEXT_AI_MAX_CHARS ?? 5000) || 5000);
 const LINE_EXPENSE_GROUP_IDS = (process.env.LINE_EXPENSE_GROUP_IDS ?? "")
   .split(",").map(s => s.trim()).filter(Boolean);
 const LINE_TIMEZONE = process.env.LINE_TIMEZONE ?? "Asia/Bangkok";
@@ -70,17 +74,17 @@ const NOVA_SECRET_KEY = (process.env.NOVA_SECRET_KEY ?? "").trim();
 const NOVA_ENABLED = Boolean(NOVA_API_URL);
 const NOVA_BASE_URL = NOVA_API_URL ? NOVA_API_URL.replace(/\/nova_process_line_message.*$/, "").replace(/\/$/, "") : null;
 
-if (!LINE_CHANNEL_SECRET || !LINE_CHANNEL_ACCESS_TOKEN) {
+if (!LINE_BOT_SELF_TEST && (!LINE_CHANNEL_SECRET || !LINE_CHANNEL_ACCESS_TOKEN)) {
   console.error("Missing LINE_CHANNEL_SECRET or LINE_CHANNEL_ACCESS_TOKEN");
   process.exit(1);
 }
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+if (!LINE_BOT_SELF_TEST && (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY)) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
   process.exit(1);
 }
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+const supabase = createClient(SUPABASE_URL || "http://localhost:54321", SUPABASE_SERVICE_ROLE_KEY || "self-test-key", {
   auth: { autoRefreshToken: false, persistSession: false },
 });
 const PENDING_REPLACE_TTL_MS = 15 * 60 * 1000;
@@ -369,6 +373,8 @@ function formatImageDigestEventLine(item) {
 async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilter = "") {
   const todayStr = slot.dateStr;
   const todayRange = getDailyRangeUtc(todayStr);
+  const hasBookingPeriodSchema = await hasBookingPeriodColumns();
+  const periodColumns = hasBookingPeriodSchema ? ", booking_start_date, booking_end_date" : "";
 
   // Thai month abbreviations
   const THAI_MONTHS = ["ม.ค.","ก.พ.","มี.ค.","เม.ย.","พ.ค.","มิ.ย.","ก.ค.","ส.ค.","ก.ย.","ต.ค.","พ.ย.","ธ.ค."];
@@ -481,7 +487,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
     if (todayRange) {
       let q = supabase
         .from("line_booking_records")
-        .select("booth_code, shop_name, project_name, event_start_date, event_end_date")
+        .select(`booth_code, shop_name, project_name, event_start_date, event_end_date${periodColumns}`)
         .eq("booking_status", "booked")
         .ilike("project_name", projectKey.replace(/%/g, "\\%"))
         .gte("booked_at", todayRange.startIso)
@@ -497,7 +503,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
     {
       let q = supabase
         .from("line_booking_records")
-        .select("booth_code, shop_name, table_free_qty, table_extra_qty, chair_free_qty, chair_extra_qty, power_amp, power_label, project_name, event_start_date, event_end_date")
+        .select(`booth_code, shop_name, table_free_qty, table_extra_qty, chair_free_qty, chair_extra_qty, power_amp, power_label, project_name, event_start_date, event_end_date${periodColumns}`)
         .eq("booking_status", "booked")
         .ilike("project_name", projectKey.replace(/%/g, "\\%"))
         .order("booth_code", { ascending: true });
@@ -1035,6 +1041,47 @@ function isoDateRangeOverlaps(startA, endA, startB, endB) {
   return aStart <= bEnd && aEnd >= bStart;
 }
 
+function getBookingStartDate(row) {
+  return normalizeSpaces(row?.booking_start_date ?? row?.bookingStartDate ?? row?.event_start_date ?? row?.eventStartDate ?? "");
+}
+
+function getBookingEndDate(row) {
+  const start = getBookingStartDate(row);
+  return normalizeSpaces(row?.booking_end_date ?? row?.bookingEndDate ?? row?.event_end_date ?? row?.eventEndDate ?? "") || start;
+}
+
+function applyBookingPeriodPayload(payload, parsed) {
+  return {
+    ...payload,
+    booking_start_date: parsed?.bookingStartDate || parsed?.eventStartDate || null,
+    booking_end_date: parsed?.bookingEndDate || parsed?.eventEndDate || parsed?.bookingStartDate || parsed?.eventStartDate || null,
+  };
+}
+
+let bookingPeriodColumnsState = null;
+
+function isMissingBookingPeriodSchemaError(error) {
+  const text = `${error?.message ?? ""} ${error?.details ?? ""} ${error?.hint ?? ""} ${error?.code ?? ""}`.toLowerCase();
+  return text.includes("booking_start_date") || text.includes("booking_end_date");
+}
+
+async function hasBookingPeriodColumns() {
+  if (bookingPeriodColumnsState !== null) return bookingPeriodColumnsState;
+  const { error } = await supabase
+    .from("line_booking_records")
+    .select("booking_start_date, booking_end_date")
+    .limit(1);
+  bookingPeriodColumnsState = !error;
+  if (error && !isMissingBookingPeriodSchemaError(error)) {
+    console.warn("[schema] booking period column check failed:", error?.message ?? error);
+  }
+  return bookingPeriodColumnsState;
+}
+
+function bookingPeriodSelectColumns() {
+  return "booking_start_date, booking_end_date, event_start_date, event_end_date";
+}
+
 function inferBookingPeriodFromText(text, projectStartDate, projectEndDate) {
   const projectStart = normalizeSpaces(projectStartDate);
   const projectEnd = normalizeSpaces(projectEndDate) || projectStart;
@@ -1067,8 +1114,8 @@ function inferBookingPeriodFromText(text, projectStartDate, projectEndDate) {
 }
 
 function formatBookingPeriodLabel(row) {
-  const start = row?.event_start_date ?? row?.eventStartDate ?? "";
-  const end = row?.event_end_date ?? row?.eventEndDate ?? "";
+  const start = getBookingStartDate(row);
+  const end = getBookingEndDate(row);
   if (!start && !end) return "";
   if (start && (!end || start === end)) return ` (${formatDateThai(start)})`;
   return ` (${formatDateThai(start)}-${formatDateThai(end)})`;
@@ -1236,6 +1283,7 @@ const helpText = [
   "Available commands:",
   "/help",
   "/agent -> show agent capabilities",
+  "/status [full] -> check Supabase/schema/digest/AI health",
   "/book project=<name> shop=<name> phone=<phone> booth=<code> type=<product> [price=<baht>]",
   `/expense amount=<baht> [project=<name>] [vendor=<name>] [type=<type>] [note=<text>] -> default project="${DEFAULT_EXPENSE_PROJECT_NAME}" if omitted`,
   "/list [project=<name>] -> show latest bookings",
@@ -2014,6 +2062,7 @@ async function findActiveBoothConflict(source, projectName, boothCode, options =
   const groupId = getGroupIdFromSource(source);
   const normalizedBooth = normalizeBoothCode(boothCode);
   if (!projectName || !normalizedBooth) return { data: null, error: null };
+  const hasBookingPeriodSchema = await hasBookingPeriodColumns();
 
   let eventStartDate = normalizeSpaces(options?.eventStartDate);
   let eventEndDate = normalizeSpaces(options?.eventEndDate);
@@ -2035,7 +2084,7 @@ async function findActiveBoothConflict(source, projectName, boothCode, options =
 
   let conflictQuery = supabase
     .from("line_booking_records")
-    .select("id, project_name, shop_name, phone, booth_code, booked_at, event_start_date, event_end_date")
+    .select(`id, project_name, shop_name, phone, booth_code, booked_at, event_start_date, event_end_date${hasBookingPeriodSchema ? ", booking_start_date, booking_end_date" : ""}`)
     .in("group_id", groupIds)
     .eq("project_name", projectName)
     .eq("booking_status", "booked")
@@ -2048,8 +2097,8 @@ async function findActiveBoothConflict(source, projectName, boothCode, options =
 
   const conflict = (data ?? []).find((row) => {
     if (normalizeBoothCode(row.booth_code) !== normalizedBooth) return false;
-    const rowStart = normalizeSpaces(row.event_start_date) || eventStartDate;
-    const rowEnd = normalizeSpaces(row.event_end_date) || rowStart;
+    const rowStart = getBookingStartDate(row) || eventStartDate;
+    const rowEnd = getBookingEndDate(row) || rowStart;
     return isoDateRangeOverlaps(eventStartDate, eventEndDate || eventStartDate, rowStart, rowEnd);
   });
 
@@ -2104,6 +2153,8 @@ function normalizeParsedBooking(parsed) {
     boothCode: normalizeBoothCode(parsed?.boothCode),
     productType: normalizeSpaces(parsed?.productType),
     note: normalizeSpaces(parsed?.note).slice(0, 1800),
+    bookingStartDate: normalizeSpaces(parsed?.bookingStartDate ?? parsed?.booking_start_date),
+    bookingEndDate: normalizeSpaces(parsed?.bookingEndDate ?? parsed?.booking_end_date),
     eventStartDate: normalizeSpaces(parsed?.eventStartDate),
     eventEndDate: normalizeSpaces(parsed?.eventEndDate),
     boothPrice: normalizeAmount(parsed?.boothPrice),
@@ -2193,6 +2244,8 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
       if (!normalized.eventEndDate) {
         normalized.eventEndDate = inferredPeriod.eventEndDate || normalized.eventStartDate || projectEndDate || "";
       }
+      if (!normalized.bookingStartDate) normalized.bookingStartDate = normalized.eventStartDate || projectStartDate || "";
+      if (!normalized.bookingEndDate) normalized.bookingEndDate = normalized.eventEndDate || normalized.bookingStartDate || projectEndDate || "";
     }
   }
 
@@ -2240,8 +2293,8 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
       effectiveBooking.projectName,
       effectiveBooking.boothCode,
       {
-        eventStartDate: effectiveBooking.eventStartDate,
-        eventEndDate: effectiveBooking.eventEndDate,
+        eventStartDate: effectiveBooking.bookingStartDate || effectiveBooking.eventStartDate,
+        eventEndDate: effectiveBooking.bookingEndDate || effectiveBooking.eventEndDate,
       },
     );
 
@@ -2349,12 +2402,13 @@ async function commandConfirmReplace(source) {
 
 async function commandConfirmReplaceById(idPrefix, source) {
   const isDirectChat = !source?.groupId && !source?.roomId;
+  const hasBookingPeriodSchema = await hasBookingPeriodColumns();
 
   let query = supabase
     .from("line_booking_records")
     .select("id, group_id, project_name, shop_name, phone, booth_code, product_type, note, " +
       "table_free_qty, table_extra_qty, chair_free_qty, chair_extra_qty, " +
-      "power_amp, power_label, booth_price, source_user_id, source_message_id")
+      `power_amp, power_label, booth_price, source_user_id, source_message_id, event_start_date, event_end_date${hasBookingPeriodSchema ? ", booking_start_date, booking_end_date" : ""}`)
     .eq("booking_status", "pending_replace")
     .order("booked_at", { ascending: false })
     .limit(200);
@@ -2395,6 +2449,10 @@ async function commandConfirmReplaceById(idPrefix, source) {
     chairExtraQty: record.chair_extra_qty,
     powerAmp: record.power_amp,
     powerLabel: record.power_label,
+    bookingStartDate: getBookingStartDate(record),
+    bookingEndDate: getBookingEndDate(record),
+    eventStartDate: record.event_start_date,
+    eventEndDate: record.event_end_date,
   };
 
   const { data: saved, error: insertError } = await insertBookingRecord(parsed, syntheticSource, record.source_message_id);
@@ -2409,6 +2467,7 @@ async function commandConfirmReplaceById(idPrefix, source) {
 
 
 async function insertBookingRecord(parsed, source, messageId) {
+  const hasBookingPeriodSchema = await hasBookingPeriodColumns();
   const basePayload = {
     group_id: getGroupIdFromSource(source),
     project_name: parsed.projectName,
@@ -2429,15 +2488,21 @@ async function insertBookingRecord(parsed, source, messageId) {
     event_start_date: parsed.eventStartDate || null,
     event_end_date: parsed.eventEndDate || null,
   };
+  const insertPayload = hasBookingPeriodSchema ? applyBookingPeriodPayload(basePayload, parsed) : basePayload;
 
   const withPriceResult = await supabase
     .from("line_booking_records")
     .insert({
-      ...basePayload,
+      ...insertPayload,
       booth_price: parsed.boothPrice ?? null,
     })
     .select("id, project_name, shop_name, phone, booth_code, booth_price, table_free_qty, table_extra_qty, chair_free_qty, chair_extra_qty, power_amp, power_label")
     .single();
+
+  if (withPriceResult.error && isMissingBookingPeriodSchemaError(withPriceResult.error)) {
+    bookingPeriodColumnsState = false;
+    return insertBookingRecord({ ...parsed, bookingStartDate: "", bookingEndDate: "" }, source, messageId);
+  }
 
   if (!withPriceResult.error || !isMissingSalesSchemaError(withPriceResult.error)) {
     return withPriceResult;
@@ -2454,7 +2519,7 @@ async function insertBookingRecord(parsed, source, messageId) {
 
 async function insertPendingProjectRecord(parsed, source, messageId) {
   const groupId = getGroupIdFromSource(source);
-  const { error } = await supabase.from("line_booking_records").insert({
+  const payload = {
     group_id: groupId,
     project_name: parsed.projectName || null,
     shop_name: parsed.shopName,
@@ -2472,7 +2537,12 @@ async function insertPendingProjectRecord(parsed, source, messageId) {
     booking_status: "needs_project",
     source_user_id: source.userId ?? null,
     source_message_id: messageId ?? null,
-  });
+    event_start_date: parsed.eventStartDate || null,
+    event_end_date: parsed.eventEndDate || null,
+  };
+  const { error } = await supabase.from("line_booking_records").insert(
+    (await hasBookingPeriodColumns()) ? applyBookingPeriodPayload(payload, parsed) : payload,
+  );
   if (error) console.error("[pending] insertPendingProjectRecord:", error?.message);
 }
 
@@ -2482,7 +2552,7 @@ async function insertPendingReplaceRecord(parsed, source, messageId, conflictId)
   const combinedNote = parsed.note
     ? `${notePrefix} | ${parsed.note}`.slice(0, 1800)
     : notePrefix;
-  const { error } = await supabase.from("line_booking_records").insert({
+  const payload = {
     group_id: groupId,
     project_name: parsed.projectName || null,
     shop_name: parsed.shopName,
@@ -2500,7 +2570,12 @@ async function insertPendingReplaceRecord(parsed, source, messageId, conflictId)
     booking_status: "pending_replace",
     source_user_id: source.userId ?? null,
     source_message_id: messageId ?? null,
-  });
+    event_start_date: parsed.eventStartDate || null,
+    event_end_date: parsed.eventEndDate || null,
+  };
+  const { error } = await supabase.from("line_booking_records").insert(
+    (await hasBookingPeriodColumns()) ? applyBookingPeriodPayload(payload, parsed) : payload,
+  );
   if (error) console.error("[pending] insertPendingReplaceRecord:", error?.message);
 }
 
@@ -3082,6 +3157,68 @@ function commandAgentStatus() {
   ].join("\n");
 }
 
+async function checkGeminiHealth() {
+  if (!GEMINI_API_KEY || LINE_AI_PROVIDER !== "gemini") return { ok: false, detail: "not configured" };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Math.min(LINE_AI_TIMEOUT_MS, 8000));
+  try {
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(LINE_AI_TEXT_MODEL)}:generateContent`;
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
+      body: JSON.stringify({ contents: [{ parts: [{ text: "Reply with exactly OK" }] }] }),
+      signal: controller.signal,
+    });
+    if (!response.ok) return { ok: false, detail: `HTTP ${response.status}` };
+    return { ok: true, detail: LINE_AI_TEXT_MODEL };
+  } catch (error) {
+    return { ok: false, detail: error?.name === "AbortError" ? "timeout" : (error?.message ?? String(error)) };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function checkNovaHealth() {
+  if (!NOVA_ENABLED || !NOVA_BASE_URL) return { ok: false, detail: "not configured" };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(`${NOVA_BASE_URL}/health`, { signal: controller.signal });
+    return response.ok ? { ok: true, detail: `HTTP ${response.status}` } : { ok: false, detail: `HTTP ${response.status}` };
+  } catch (error) {
+    return { ok: false, detail: error?.name === "AbortError" ? "timeout" : (error?.message ?? String(error)) };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function commandSystemStatus(text = "") {
+  const full = /\b(full|ai|gemini|deep)\b/i.test(text);
+  const lines = ["System status"];
+
+  const { error: supabaseError } = await supabase
+    .from("line_project_pricing")
+    .select("project_name")
+    .limit(1);
+  lines.push(`Supabase: ${supabaseError ? `FAIL (${supabaseError.message})` : "OK"}`);
+
+  const hasPeriodColumns = await hasBookingPeriodColumns();
+  lines.push(`Booking period schema: ${hasPeriodColumns ? "OK (booking_start_date/booking_end_date)" : "MISSING (fallback uses event_start_date/event_end_date)"}`);
+  lines.push(`Digest schedule: ${LINE_IMAGE_SUMMARY_ENABLED ? LINE_IMAGE_SUMMARY_HOURS.join(",") + ":00" : "disabled"}`);
+  lines.push(`Text AI fallback: ${LINE_AI_TEXT_FALLBACK_ENABLED ? `${LINE_AI_PROVIDER || "unknown"} (${LINE_TEXT_AI_MIN_CHARS}-${LINE_TEXT_AI_MAX_CHARS} chars gate)` : "disabled"}`);
+  lines.push(`Nova: ${NOVA_ENABLED ? "configured" : "not configured"}`);
+
+  if (full) {
+    const [gemini, nova] = await Promise.all([checkGeminiHealth(), checkNovaHealth()]);
+    lines.push(`Gemini live: ${gemini.ok ? "OK" : "FAIL"} (${gemini.detail})`);
+    lines.push(`Nova live: ${nova.ok ? "OK" : "FAIL"} (${nova.detail})`);
+  } else {
+    lines.push("Use /status full to test Gemini/Nova live.");
+  }
+
+  return lines.join("\n").slice(0, 4900);
+}
+
 async function commandSetProject(text, source) {
   return "Default project is disabled. Please include project/event name in each booking or import file.";
 }
@@ -3403,6 +3540,26 @@ async function commandBookingFromTemplate(text, source, messageId) {
   return result.silent ? null : result.message;
 }
 
+function shouldUseTextAiFallback(text, reason = "unknown") {
+  if (!LINE_AI_TEXT_FALLBACK_ENABLED) return false;
+  const raw = normalizeSpaces(text);
+  const minChars = reason === "event" ? 40 : LINE_TEXT_AI_MIN_CHARS;
+  if (raw.length < minChars || raw.length > LINE_TEXT_AI_MAX_CHARS) return false;
+  if (reason === "booking") return looksLikeBookingText(raw) || looksLikeBookingForm(raw);
+  if (reason === "expense") return looksLikeExpenseText(raw) || mightBeUnrecognizedExpense(raw);
+  if (reason === "event") return looksLikeEventCreationText(raw);
+  return looksLikeBookingText(raw) || looksLikeExpenseText(raw) || looksLikeEventCreationText(raw);
+}
+
+function looksLikeEventCreationText(text) {
+  const raw = normalizeSpaces(text).toLowerCase();
+  if (!raw) return false;
+  const hasProjectWord = /งาน|event|project|โปรเจกต์|โปรเจค|ชื่องาน/.test(raw);
+  const hasDate = /\d{1,2}\s*[-–]\s*\d{1,2}|\d{1,2}\s*[\/-]\s*\d{1,2}|พ\.?ค\.?|มิ\.?ย\.?|ก\.?ค\.?|เม\.?ย\.?/.test(raw);
+  const hasBoothContext = /บูธ|booth|พื้นที่|ผัง|แปลน|plan/.test(raw);
+  return hasProjectWord && (hasDate || hasBoothContext);
+}
+
 async function tryAutoBookingText(text, source, messageId, lineEvent = null) {
   const looksLike = looksLikeBookingText(text);
   console.log(`[text] looksLikeBooking=${looksLike} chars=${text.length} preview=${text.slice(0, 60).replace(/\n/g, "↵")}`);
@@ -3417,7 +3574,7 @@ async function tryAutoBookingText(text, source, messageId, lineEvent = null) {
   console.log(`[text] structuredParse project=${parsed?.projectName ?? "-"} shop=${parsed?.shopName ?? "-"} booth=${parsed?.boothCode ?? "-"}`);
 
   if (!parsed) {
-    if (!LINE_AI_TEXT_FALLBACK_ENABLED) return null;
+    if (!shouldUseTextAiFallback(text, "booking")) return null;
     const analysis = await callAIForTextParse(text, lineEvent);
     const classification = inferAiClassification(analysis, text);
     if (classification !== "booking") return null;
@@ -5160,6 +5317,9 @@ async function handleTextMessage(event) {
 
   if (normalized === "/help" || normalized === thaiHelp) return helpText;
   if (/^\/agent(?:\s|$)/i.test(normalized)) return commandAgentStatus();
+  if (/^\/status(?:\s|$)/i.test(normalized) || /^\/health(?:\s|$)/i.test(normalized)) {
+    return commandSystemStatus(normalized);
+  }
 
   if (normalized === "/groupid") {
     const gid = source.groupId ?? source.roomId ?? null;
@@ -5337,7 +5497,7 @@ async function handleTextMessage(event) {
     }
   }
 
-  if (!normalized.startsWith("/") && NOVA_ENABLED) {
+  if (!normalized.startsWith("/") && NOVA_ENABLED && shouldUseTextAiFallback(rawText, "event")) {
     const novaRaw = await callTextParseWithNova(rawText, event);
     if (novaRaw?.action === "create_event") {
       const ev = novaRaw._raw?.structuredData?.event ?? {};
@@ -5399,7 +5559,7 @@ async function handleTextMessage(event) {
     return null; // silent - reported in digest
   }
 
-  if (LINE_AI_TEXT_FALLBACK_ENABLED && mightBeUnrecognizedExpense(rawText)) {
+  if (shouldUseTextAiFallback(rawText, "expense") && mightBeUnrecognizedExpense(rawText)) {
     const analysis = await callAIForTextParse(rawText);
     const classification = inferAiClassification(analysis, rawText);
     if (classification === "expense") {
@@ -5810,6 +5970,46 @@ async function processEvent(event) {
     }
   }
 }
+
+function assertSelfTest(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+async function runSelfTests() {
+  const p1 = inferBookingPeriodFromText("ร้าน A (8-16/5)", "2026-05-08", "2026-05-28");
+  assertSelfTest(p1.eventStartDate === "2026-05-08" && p1.eventEndDate === "2026-05-16", "period 8-16/5");
+
+  const p2 = inferBookingPeriodFromText("ร้าน B (17 - 25/5)", "2026-05-08", "2026-05-28");
+  assertSelfTest(p2.eventStartDate === "2026-05-17" && p2.eventEndDate === "2026-05-25", "period 17-25/5");
+
+  const p3 = inferBookingPeriodFromText("ร้าน C 17 - 28 พ.ค", "2026-05-08", "2026-05-28");
+  assertSelfTest(p3.eventStartDate === "2026-05-17" && p3.eventEndDate === "2026-05-28", "period Thai month");
+
+  assertSelfTest(isoDateRangeOverlaps("2026-05-08", "2026-05-16", "2026-05-17", "2026-05-28") === false, "adjacent periods must not conflict");
+  assertSelfTest(isoDateRangeOverlaps("2026-05-08", "2026-05-16", "2026-05-16", "2026-05-28") === true, "same-day overlap must conflict");
+
+  const form = [
+    "1. ชื่องาน: The Makers Market",
+    "2. วันที่จัดงาน : 13-24 พ.ค.2026",
+    "3. เลขบูธที่จะจอง: 36 วันละ 2,000",
+    "4. ชื่อร้าน: queen Beans",
+    "6. เบอร์โทร: 0870822233",
+  ].join("\n");
+  const parsed = await parseBookingFormText(form, "test-group");
+  assertSelfTest(normalizeBoothCode(parsed.boothCode) === "36", "booth code strips price suffix");
+  assertSelfTest(parsed.projectName && parsed.shopName, "form parser extracts project and shop");
+
+  console.log("LINE bot self-tests passed");
+}
+
+if (LINE_BOT_SELF_TEST) {
+  runSelfTests()
+    .then(() => process.exit(0))
+    .catch((error) => {
+      console.error("LINE bot self-tests failed:", error);
+      process.exit(1);
+    });
+} else {
 const server = http.createServer(async (req, res) => {
   const reqUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
 
@@ -5879,6 +6079,7 @@ server.listen(PORT, () => {
   startImageDigestScheduler();
   startEventReminderScheduler();
 });
+}
 
 
 
