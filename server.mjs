@@ -1001,6 +1001,39 @@ async function resolveProjectFromSheetName(sheetName, groupId) {
   return "";
 }
 
+function isoDateRangeOverlaps(startA, endA, startB, endB) {
+  if (!startA || !startB) return false;
+  const aStart = startA;
+  const aEnd = endA || startA;
+  const bStart = startB;
+  const bEnd = endB || startB;
+  return aStart <= bEnd && aEnd >= bStart;
+}
+
+async function resolveProjectFromEventDates(groupId, eventStartDate, eventEndDate) {
+  const start = normalizeSpaces(eventStartDate);
+  const end = normalizeSpaces(eventEndDate) || start;
+  if (!groupId || !/^\d{4}-\d{2}-\d{2}$/.test(start)) return "";
+
+  const { data, error } = await supabase
+    .from("line_project_pricing")
+    .select("project_name, event_start_date, event_end_date")
+    .eq("group_id", groupId)
+    .not("event_start_date", "is", null);
+
+  if (error || !data?.length) return "";
+
+  const overlaps = data.filter((proj) =>
+    isoDateRangeOverlaps(start, end, proj.event_start_date, proj.event_end_date),
+  );
+  if (overlaps.length === 1) return overlaps[0].project_name;
+
+  const exact = overlaps.filter((proj) =>
+    proj.event_start_date === start && (proj.event_end_date || proj.event_start_date) === end,
+  );
+  return exact.length === 1 ? exact[0].project_name : "";
+}
+
 async function getGroupDefaultProject(groupId) {
   const { data, error } = await supabase
     .from("line_group_settings")
@@ -2027,6 +2060,26 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
   const normalized = normalizeParsedBooking(parsed);
   const forceReplace = options.forceReplace === true;
   let replacedConflict = null;
+  const groupId = getGroupIdFromSource(source);
+
+  const projectByDates = await resolveProjectFromEventDates(
+    groupId,
+    normalized.eventStartDate,
+    normalized.eventEndDate,
+  );
+  if (!normalized.projectName && projectByDates) {
+    normalized.projectName = projectByDates;
+    console.log(`[booking] project resolved by event dates: ${projectByDates}`);
+  } else if (
+    normalized.projectName &&
+    projectByDates &&
+    normalizeKey(normalized.projectName) !== normalizeKey(projectByDates)
+  ) {
+    console.warn(
+      `[booking] project/date mismatch project="${normalized.projectName}" dates=${normalized.eventStartDate}..${normalized.eventEndDate} -> "${projectByDates}"`,
+    );
+    normalized.projectName = projectByDates;
+  }
 
   if (!hasRequiredBookingFields(normalized)) {
     return {
@@ -3302,9 +3355,7 @@ async function tryAutoBookingText(text, source, messageId, lineEvent = null) {
           .gte("event_end_date", todayStr)
           .order("event_start_date", { ascending: true });
         const activeProjects = (projData ?? []).map((p) => p.project_name).filter(Boolean);
-        if (activeProjects.length === 1) {
-          aiParsed.projectName = activeProjects[0];
-        } else if (activeProjects.length > 1) {
+        if (activeProjects.length > 0) {
           setPendingProjectSelection(source, { parsed: aiParsed, messageId });
           insertPendingProjectRecord(aiParsed, source, messageId).catch(console.error);
           const projectList = activeProjects.map((p, i) => `${i + 1}. ${p}`).join("\n");
@@ -4881,9 +4932,7 @@ async function commandBookingFromImage(event) {
           .order("event_start_date", { ascending: true });
         activeProjects = (data ?? []).map((p) => p.project_name).filter(Boolean);
       }
-      if (activeProjects.length === 1) {
-        parsed.projectName = activeProjects[0];
-      } else if (activeProjects.length > 1) {
+      if (activeProjects.length > 0) {
         setPendingProjectSelection(source, { parsed, messageId });
         insertPendingProjectRecord(parsed, source, messageId).catch(console.error);
         const projectList = activeProjects.map((p, i) => `${i + 1}. ${p}`).join("\n");
