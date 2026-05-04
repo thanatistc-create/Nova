@@ -1121,6 +1121,56 @@ function formatBookingPeriodLabel(row) {
   return ` (${formatDateThai(start)}-${formatDateThai(end)})`;
 }
 
+function parseEventString(text) {
+  const raw = normalizeSpaces(toAsciiDigits(String(text ?? "")));
+  if (!raw) return null;
+
+  const thaiMonths = new Map([
+    ["มค", 1], ["ม.ค", 1], ["มกราคม", 1],
+    ["กพ", 2], ["ก.พ", 2], ["กุมภาพันธ์", 2],
+    ["มีค", 3], ["มี.ค", 3], ["มีนาคม", 3],
+    ["เมย", 4], ["เม.ย", 4], ["เมษายน", 4],
+    ["พค", 5], ["พ.ค", 5], ["พฤษภาคม", 5],
+    ["มิย", 6], ["มิ.ย", 6], ["มิถุนายน", 6],
+    ["กค", 7], ["ก.ค", 7], ["กรกฎาคม", 7],
+    ["สค", 8], ["ส.ค", 8], ["สิงหาคม", 8],
+    ["กย", 9], ["ก.ย", 9], ["กันยายน", 9],
+    ["ตค", 10], ["ต.ค", 10], ["ตุลาคม", 10],
+    ["พย", 11], ["พ.ย", 11], ["พฤศจิกายน", 11],
+    ["ธค", 12], ["ธ.ค", 12], ["ธันวาคม", 12],
+  ]);
+
+  const thaiMonthPattern = [...thaiMonths.keys()]
+    .sort((a, b) => b.length - a.length)
+    .map((name) => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("|");
+  const thaiRange = new RegExp(
+    `(?:รอบ\\s*)?(\\d{1,2})\\s*[-–]\\s*(\\d{1,2})[.\\s]*(${thaiMonthPattern})\\s*(\\d{2,4})?`,
+    "i",
+  );
+  const match = raw.match(thaiRange);
+  if (match) {
+    const startDay = Number(match[1]);
+    const endDay = Number(match[2]);
+    const month = thaiMonths.get(match[3].replace(/\./g, "")) ?? thaiMonths.get(match[3]);
+    const yearRaw = match[4] ? Number(match[4]) : null;
+    const year = yearRaw
+      ? (yearRaw < 100 ? 2500 + yearRaw - 543 : toGregorianYear(yearRaw))
+      : null;
+    if (month && year) {
+      const startDate = formatIsoDate(year, month, startDay);
+      const endDate = formatIsoDate(year, month, endDay);
+      if (startDate && endDate) return { startDate, endDate };
+    }
+  }
+
+  const extracted = extractEventDateRange(raw);
+  if (extracted.eventStartDate) {
+    return { startDate: extracted.eventStartDate, endDate: extracted.eventEndDate || extracted.eventStartDate };
+  }
+  return null;
+}
+
 async function resolveProjectFromEventDates(groupId, eventStartDate, eventEndDate) {
   const start = normalizeSpaces(eventStartDate);
   const end = normalizeSpaces(eventEndDate) || start;
@@ -5869,9 +5919,18 @@ async function handleFileMessage(event) {
     }
 
     const sheetProjectMap = {};
+    const sheetDatesMap = {};
     for (const sheetName of workbook.SheetNames) {
-      sheetProjectMap[sheetName] = await resolveProjectFromSheetName(sheetName, groupId);
-      console.log(`[file] xlsx:sheet="${sheetName}" → project="${sheetProjectMap[sheetName]}"`);
+      const sheet = workbook.Sheets[sheetName];
+      const b1Text = normalizeSpaces(String(sheet["B1"]?.v ?? ""));
+      let resolved = "";
+      if (b1Text.length > 3) resolved = await resolveProjectFromSheetName(b1Text, groupId);
+      if (!resolved || resolved === b1Text) resolved = await resolveProjectFromSheetName(sheetName, groupId);
+      sheetProjectMap[sheetName] = resolved || "";
+      sheetDatesMap[sheetName] = parseEventString(b1Text) ?? parseEventString(sheetName);
+      console.log(
+        `[file] xlsx:sheet="${sheetName}" b1="${b1Text.slice(0, 50)}" → project="${sheetProjectMap[sheetName]}" dates=${JSON.stringify(sheetDatesMap[sheetName])}`,
+      );
     }
 
     excelRows = [];
@@ -5884,6 +5943,7 @@ async function handleFileMessage(event) {
         console.log(`[file] xlsx:sample row[0]=${JSON.stringify(rows[0]).slice(0, 200)}`);
         firstSheetLogged = true;
       }
+      const sheetDates = sheetDatesMap[sheetName];
       let lastShopName = "";
       for (const row of rows) {
         const pick = (...keys) => normalizeSpaces(String(keys.map((k) => row[k] ?? "").find((v) => v !== "") ?? ""));
@@ -5896,7 +5956,15 @@ async function handleFileMessage(event) {
         const note = pick("note", "หมายเหตุ", "Note");
         const isSummaryRow = /^(total|รวม|ผลรวม|สรุป|summary|sub\s*total|grand\s*total|ทั้งหมด)$/i.test(shopName);
         if (boothCode && shopName && !isSummaryRow && !isImportArtifactShopName(shopName)) {
-          excelRows.push({ boothCode, shopName, projectName, phone, note });
+          excelRows.push({
+            boothCode,
+            shopName,
+            projectName,
+            phone,
+            note,
+            eventStartDate: sheetDates?.startDate ?? null,
+            eventEndDate: sheetDates?.endDate ?? null,
+          });
         }
       }
     }
