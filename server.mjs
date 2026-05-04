@@ -506,8 +506,14 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
       allBookings = (data ?? []).filter((r) => (r.project_name ?? "").toLowerCase().trim() === projectKey);
     }
 
-    const bookedCount = allBookings.length;
-    const totalLabel = totalBooths ? `${bookedCount}/${totalBooths}` : String(bookedCount);
+    const occupiedBoothCodes = new Set(
+      allBookings.map((b) => normalizeBoothCode(b.booth_code)).filter(Boolean),
+    );
+    const occupiedBoothCount = occupiedBoothCodes.size;
+    const bookingRecordCount = allBookings.length;
+    const totalLabel = totalBooths ? `${occupiedBoothCount}/${totalBooths}` : String(occupiedBoothCount);
+    const bookingCountLabel =
+      bookingRecordCount > occupiedBoothCount ? ` | ${bookingRecordCount} รายการจอง` : "";
 
     // Collect structured data for Nova summary
     projectsData.push({
@@ -542,7 +548,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
     }
 
     // All booths section
-    lines.push(`[สรุปพื้นที่ทั้งหมด (${totalLabel} บูธ)] (✅ = จองแล้ว, ⬜ = ว่าง)`);
+    lines.push(`[สรุปพื้นที่ทั้งหมด (${totalLabel} บูธ${bookingCountLabel})] (✅ = จองแล้ว, ⬜ = ว่าง)`);
     if (allBookings.length) {
       const boothMap = new Map();
       for (const b of allBookings) {
