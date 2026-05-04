@@ -481,7 +481,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
     if (todayRange) {
       let q = supabase
         .from("line_booking_records")
-        .select("booth_code, shop_name, project_name")
+        .select("booth_code, shop_name, project_name, event_start_date, event_end_date")
         .eq("booking_status", "booked")
         .ilike("project_name", projectKey.replace(/%/g, "\\%"))
         .gte("booked_at", todayRange.startIso)
@@ -497,7 +497,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
     {
       let q = supabase
         .from("line_booking_records")
-        .select("booth_code, shop_name, table_free_qty, table_extra_qty, chair_free_qty, chair_extra_qty, power_amp, power_label, project_name")
+        .select("booth_code, shop_name, table_free_qty, table_extra_qty, chair_free_qty, chair_extra_qty, power_amp, power_label, project_name, event_start_date, event_end_date")
         .eq("booking_status", "booked")
         .ilike("project_name", projectKey.replace(/%/g, "\\%"))
         .order("booth_code", { ascending: true });
@@ -522,6 +522,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
       allBookings: allBookings.map((b) => ({
         boothCode: normalizeBoothCode(b.booth_code) || "-",
         shopName: b.shop_name || "-",
+        period: formatBookingPeriodLabel(b),
         tableQty: Number(b.table_free_qty ?? 0) + Number(b.table_extra_qty ?? 0),
         chairQty: Number(b.chair_free_qty ?? 0) + Number(b.chair_extra_qty ?? 0),
         power: b.power_label || (b.power_amp ? `${b.power_amp}A` : null) || "-",
@@ -534,7 +535,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
     lines.push(`[อัปเดตจองใหม่วันนี้]`);
     if (todayBookings.length) {
       for (const b of todayBookings.slice(0, 20))
-        lines.push(`• บูธ ${normalizeBoothCode(b.booth_code) || "-"} | ร้าน ${b.shop_name || "-"}`);
+        lines.push(`• บูธ ${normalizeBoothCode(b.booth_code) || "-"} | ร้าน ${b.shop_name || "-"}${formatBookingPeriodLabel(b)}`);
       if (todayBookings.length > 20) lines.push(`  ... และอีก ${todayBookings.length - 20} รายการ`);
     } else {
       lines.push("ไม่มีการจองใหม่วันนี้");
@@ -544,19 +545,26 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
     lines.push(`[สรุปพื้นที่ทั้งหมด (${totalLabel} บูธ)] (✅ = จองแล้ว, ⬜ = ว่าง)`);
     if (allBookings.length) {
       const boothMap = new Map();
-      for (const b of allBookings) boothMap.set(normalizeBoothCode(b.booth_code) ?? "", b);
+      for (const b of allBookings) {
+        const key = normalizeBoothCode(b.booth_code) ?? "";
+        if (!boothMap.has(key)) boothMap.set(key, []);
+        boothMap.get(key).push(b);
+      }
 
       const numTotal = totalBooths ? Number(totalBooths) : null;
       if (numTotal && !isNaN(numTotal)) {
         // Show full range 1..totalBooths
         for (let i = 1; i <= numTotal; i++) {
           const bc = String(i);
-          const b = boothMap.get(bc);
-          if (b) {
-            const t = Number(b.table_free_qty ?? 0) + Number(b.table_extra_qty ?? 0);
-            const c = Number(b.chair_free_qty ?? 0) + Number(b.chair_extra_qty ?? 0);
-            const pwr = b.power_label || (b.power_amp ? `${b.power_amp}A` : "-");
-            lines.push(`✅ บูธ ${i} | ${b.shop_name || "-"} | โต๊ะ ${t} | เก้าอี้ ${c} | ไฟ ${pwr}`);
+          const bookings = boothMap.get(bc);
+          if (bookings?.length) {
+            const boothDetails = bookings.map((b) => {
+              const t = Number(b.table_free_qty ?? 0) + Number(b.table_extra_qty ?? 0);
+              const c = Number(b.chair_free_qty ?? 0) + Number(b.chair_extra_qty ?? 0);
+              const pwr = b.power_label || (b.power_amp ? `${b.power_amp}A` : "-");
+              return `${b.shop_name || "-"}${formatBookingPeriodLabel(b)} | โต๊ะ ${t} | เก้าอี้ ${c} | ไฟ ${pwr}`;
+            }).join(" / ");
+            lines.push(`✅ บูธ ${i} | ${boothDetails}`);
           } else {
             lines.push(`⬜ บูธ ${i} | - ว่าง -`);
           }
@@ -567,7 +575,7 @@ async function buildBookingDigestMessage(slot, groupId, reviewItems, projectFilt
           const t = Number(b.table_free_qty ?? 0) + Number(b.table_extra_qty ?? 0);
           const c = Number(b.chair_free_qty ?? 0) + Number(b.chair_extra_qty ?? 0);
           const pwr = b.power_label || (b.power_amp ? `${b.power_amp}A` : "-");
-          lines.push(`✅ บูธ ${normalizeBoothCode(b.booth_code) || "-"} | ${b.shop_name || "-"} | โต๊ะ ${t} | เก้าอี้ ${c} | ไฟ ${pwr}`);
+          lines.push(`✅ บูธ ${normalizeBoothCode(b.booth_code) || "-"} | ${b.shop_name || "-"}${formatBookingPeriodLabel(b)} | โต๊ะ ${t} | เก้าอี้ ${c} | ไฟ ${pwr}`);
         }
         if (allBookings.length > 50) lines.push(`... และอีก ${allBookings.length - 50} บูธ`);
       }
@@ -843,6 +851,17 @@ function extractDatesFromText(text) {
   }
   // Fallback: numeric patterns like 29/04, 8/05 (only when no Thai months found)
   if (!foundThaiDates) {
+    const reSharedMonthRange = /(\d{1,2})\s*[-–]\s*(\d{1,2})\s*[\/\-]\s*(\d{1,2})(?:[\/\-](\d{2,4}))?/g;
+    let rangeMatch;
+    while ((rangeMatch = reSharedMonthRange.exec(raw)) !== null) {
+      const startDay = parseInt(rangeMatch[1], 10);
+      const endDay = parseInt(rangeMatch[2], 10);
+      const month = parseInt(rangeMatch[3], 10);
+      if (startDay >= 1 && startDay <= 31 && endDay >= 1 && endDay <= 31 && month >= 1 && month <= 12) {
+        dates.push({ day: startDay, month });
+        dates.push({ day: endDay, month });
+      }
+    }
     const re = /(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?/g;
     let m;
     while ((m = re.exec(raw)) !== null) {
@@ -1008,6 +1027,45 @@ function isoDateRangeOverlaps(startA, endA, startB, endB) {
   const bStart = startB;
   const bEnd = endB || startB;
   return aStart <= bEnd && aEnd >= bStart;
+}
+
+function inferBookingPeriodFromText(text, projectStartDate, projectEndDate) {
+  const projectStart = normalizeSpaces(projectStartDate);
+  const projectEnd = normalizeSpaces(projectEndDate) || projectStart;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(projectStart)) {
+    return { eventStartDate: "", eventEndDate: "" };
+  }
+
+  const raw = normalizeSpaces(text);
+  if (!raw) return { eventStartDate: "", eventEndDate: "" };
+
+  const explicit = extractEventDateRange(raw);
+  if (explicit.eventStartDate) return explicit;
+
+  const dates = extractDatesFromText(raw);
+  if (!dates.length) return { eventStartDate: "", eventEndDate: "" };
+
+  const startYear = Number(projectStart.slice(0, 4));
+  const start = dates[0];
+  const end = dates[dates.length - 1];
+  let endYear = startYear;
+  if (end.month < start.month || (end.month === start.month && end.day < start.day)) endYear += 1;
+
+  const inferredStart = formatIsoDate(startYear, start.month, start.day);
+  const inferredEnd = formatIsoDate(endYear, end.month, end.day);
+  if (!inferredStart || !inferredEnd) return { eventStartDate: "", eventEndDate: "" };
+  if (!isoDateRangeOverlaps(inferredStart, inferredEnd, projectStart, projectEnd)) {
+    return { eventStartDate: "", eventEndDate: "" };
+  }
+  return { eventStartDate: inferredStart, eventEndDate: inferredEnd };
+}
+
+function formatBookingPeriodLabel(row) {
+  const start = row?.event_start_date ?? row?.eventStartDate ?? "";
+  const end = row?.event_end_date ?? row?.eventEndDate ?? "";
+  if (!start && !end) return "";
+  if (start && (!end || start === end)) return ` (${formatDateThai(start)})`;
+  return ` (${formatDateThai(start)}-${formatDateThai(end)})`;
 }
 
 async function resolveProjectFromEventDates(groupId, eventStartDate, eventEndDate) {
@@ -1971,26 +2029,23 @@ async function findActiveBoothConflict(source, projectName, boothCode, options =
 
   let conflictQuery = supabase
     .from("line_booking_records")
-    .select("id, project_name, shop_name, phone, booth_code, booked_at")
+    .select("id, project_name, shop_name, phone, booth_code, booked_at, event_start_date, event_end_date")
     .in("group_id", groupIds)
     .eq("project_name", projectName)
     .eq("booking_status", "booked")
     .order("booked_at", { ascending: false })
     .limit(500);
 
-  if (/^\d{4}-\d{2}-\d{2}$/.test(eventStartDate)) {
-    const windowStart = new Date(`${eventStartDate}T00:00:00.000Z`);
-    windowStart.setUTCDate(windowStart.getUTCDate() - BOOKING_CONFLICT_LOOKBACK_DAYS);
-    conflictQuery = conflictQuery.gte("booked_at", windowStart.toISOString());
-  }
-
   const { data, error } = await conflictQuery;
 
   if (error) return { data: null, error };
 
-  const conflict = (data ?? []).find(
-    (row) => normalizeBoothCode(row.booth_code) === normalizedBooth,
-  );
+  const conflict = (data ?? []).find((row) => {
+    if (normalizeBoothCode(row.booth_code) !== normalizedBooth) return false;
+    const rowStart = normalizeSpaces(row.event_start_date) || eventStartDate;
+    const rowEnd = normalizeSpaces(row.event_end_date) || rowStart;
+    return isoDateRangeOverlaps(eventStartDate, eventEndDate || eventStartDate, rowStart, rowEnd);
+  });
 
   return { data: conflict ?? null, error: null };
 }
@@ -2117,6 +2172,24 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
     }
   }
 
+  if (normalized.projectName) {
+    const { eventStartDate: projectStartDate, eventEndDate: projectEndDate, error: projectDateError } =
+      await getProjectEventDates(groupId, normalized.projectName);
+    if (!projectDateError) {
+      const inferredPeriod = inferBookingPeriodFromText(
+        `${normalized.shopName} ${normalized.note}`,
+        projectStartDate,
+        projectEndDate,
+      );
+      if (!normalized.eventStartDate) {
+        normalized.eventStartDate = inferredPeriod.eventStartDate || projectStartDate || "";
+      }
+      if (!normalized.eventEndDate) {
+        normalized.eventEndDate = inferredPeriod.eventEndDate || normalized.eventStartDate || projectEndDate || "";
+      }
+    }
+  }
+
   const effectiveBooking = { ...normalized };
 
   // Reject booking if the event has already ended (skip for Excel import)
@@ -2161,8 +2234,8 @@ async function saveBookingWithAgentRules(parsed, source, messageId, options = {}
       effectiveBooking.projectName,
       effectiveBooking.boothCode,
       {
-        eventStartDate: parsed?.eventStartDate,
-        eventEndDate: parsed?.eventEndDate,
+        eventStartDate: effectiveBooking.eventStartDate,
+        eventEndDate: effectiveBooking.eventEndDate,
       },
     );
 
