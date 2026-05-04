@@ -62,6 +62,7 @@ const LINE_IMAGE_SUMMARY_HOURS = parseDigestHours(process.env.LINE_IMAGE_SUMMARY
 const LINE_IMAGE_SUMMARY_MAX_ITEMS = normalizeDigestMaxItems(process.env.LINE_IMAGE_SUMMARY_MAX_ITEMS, 8);
 const LINE_DIRECT_DEFAULT_GROUP_ID = (process.env.LINE_DIRECT_DEFAULT_GROUP_ID ?? "C4d1c5fae34484d0e6af8c47b7478e6f7").trim();
 const IMAGE_DIGEST_STATE_FILE = path.join(__dirname, ".line-image-digest.json");
+const LINE_HEALTH_STATE_FILE = path.join(__dirname, ".line-health-state.json");
 const LINE_AI_TEXT_FALLBACK_ENABLED =
   String(process.env.LINE_AI_TEXT_FALLBACK_ENABLED ?? "true").toLowerCase() !== "false" &&
   ((LINE_AI_PROVIDER === "gemini" && Boolean(GEMINI_API_KEY)) ||
@@ -95,6 +96,23 @@ const pendingProjectSelectionByActor = new Map();
 const EXPENSE_MIGRATION_HINT = "Expense table not found. Run supabase/line_bot_expense_migration.sql in Supabase SQL Editor first.";
 const SALES_MIGRATION_HINT = "Sales schema not ready. Run supabase/line_bot_sales_migration.sql in Supabase SQL Editor first.";
 const DEFAULT_EXPENSE_PROJECT_NAME = "ไม่ระบุโปรเจกต์";
+
+function readJsonFileSafe(filepath, fallback = {}) {
+  try {
+    if (!fs.existsSync(filepath)) return fallback;
+    return JSON.parse(fs.readFileSync(filepath, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJsonFileSafe(filepath, value) {
+  try {
+    fs.writeFileSync(filepath, JSON.stringify(value, null, 2), "utf8");
+  } catch (error) {
+    console.warn(`[state] failed to write ${path.basename(filepath)}:`, error?.message ?? error);
+  }
+}
 
 function normalizeTimeoutMs(value, fallback) {
   const parsed = Number(value);
@@ -202,6 +220,37 @@ function verifySignature(rawBody, signature) {
   return crypto.timingSafeEqual(digestBuf, signatureBuf);
 }
 
+function maskLineTargetForHealth(target) {
+  const raw = String(target ?? "");
+  if (!raw) return "";
+  return raw.length <= 10 ? raw : `${raw.slice(0, 6)}...${raw.slice(-4)}`;
+}
+
+function recordLineHealth(kind, payload = {}) {
+  const state = readJsonFileSafe(LINE_HEALTH_STATE_FILE, {});
+  const now = new Date().toISOString();
+  const entry = {
+    ok: payload.ok === true,
+    at: now,
+    status: payload.status ?? null,
+    target: maskLineTargetForHealth(payload.target),
+    message: normalizeSpaces(payload.message ?? "").slice(0, 500),
+  };
+  state[kind] = entry;
+  state.last = { kind, ...entry };
+  writeJsonFileSafe(LINE_HEALTH_STATE_FILE, state);
+}
+
+function formatLineHealthStatus() {
+  const state = readJsonFileSafe(LINE_HEALTH_STATE_FILE, {});
+  const last = state.last;
+  if (!last?.at) return "LINE last send: no data yet";
+  const status = last.ok ? "OK" : `FAIL ${last.status ?? ""}`.trim();
+  const target = last.target ? ` target=${last.target}` : "";
+  const detail = last.message ? ` detail=${last.message}` : "";
+  return `LINE last ${last.kind}: ${status} at ${last.at}${target}${detail}`;
+}
+
 async function replyMessage(replyToken, messages) {
   if (!replyToken || !messages?.length) return;
   const payload = {
@@ -223,6 +272,9 @@ async function replyMessage(replyToken, messages) {
   if (!response.ok) {
     const text = await response.text();
     console.error("LINE reply failed:", response.status, text);
+    recordLineHealth("reply", { ok: false, status: response.status, message: text });
+  } else {
+    recordLineHealth("reply", { ok: true, status: response.status });
   }
 }
 
@@ -243,8 +295,10 @@ async function pushMessage(target, messages) {
   if (!response.ok) {
     const text = await response.text();
     console.error("LINE push failed:", response.status, text);
+    recordLineHealth("push", { ok: false, status: response.status, target, message: text });
     return false;
   }
+  recordLineHealth("push", { ok: true, status: response.status, target });
   return true;
 }
 
@@ -884,6 +938,7 @@ function extractDatesFromText(text) {
       }
     }
   }
+
   return dates;
 }
 
@@ -3255,6 +3310,7 @@ async function commandSystemStatus(text = "") {
   const hasPeriodColumns = await hasBookingPeriodColumns();
   lines.push(`Booking period schema: ${hasPeriodColumns ? "OK (booking_start_date/booking_end_date)" : "MISSING (fallback uses event_start_date/event_end_date)"}`);
   lines.push(`Digest schedule: ${LINE_IMAGE_SUMMARY_ENABLED ? LINE_IMAGE_SUMMARY_HOURS.join(",") + ":00" : "disabled"}`);
+  lines.push(formatLineHealthStatus());
   lines.push(`Text AI fallback: ${LINE_AI_TEXT_FALLBACK_ENABLED ? `${LINE_AI_PROVIDER || "unknown"} (${LINE_TEXT_AI_MIN_CHARS}-${LINE_TEXT_AI_MAX_CHARS} chars gate)` : "disabled"}`);
   lines.push(`Nova: ${NOVA_ENABLED ? "configured" : "not configured"}`);
 
@@ -5804,6 +5860,54 @@ function powerPriceToLabel(price) {
   const map = { 0: "5A (ฟรี)", 500: "5A 24ชม", 700: "10-15A", 1000: "20-30A", 1200: "10-15A 24ชม", 1500: "⚠️ ตรวจสอบ (30A 3เฟส หรือ 20-30A 24ชม)", 2000: "30A 3เฟส 24ชม" };
   return map[p] ?? (p > 0 ? String(p) + " บ." : "-");
 }
+const EXCEL_COLUMN_ALIASES = {
+  boothCode: ["booth_code", "booth", "บูธ", "บูท", "เลขบูธ"],
+  shopName: ["shop_name", "shop", "ชื่อร้าน", "ร้าน"],
+  phone: ["phone", "เบอร์โทร", "เบอร์"],
+  note: ["note", "หมายเหตุ"],
+};
+
+function normalizeExcelHeaderCell(value) {
+  return normalizeKey(normalizeSpaces(String(value ?? "")));
+}
+
+function buildExcelColumnIndexMap(headerRow = []) {
+  const normalizedHeaderRow = headerRow.map((value) => normalizeExcelHeaderCell(value));
+  const indices = {};
+  for (const [field, aliases] of Object.entries(EXCEL_COLUMN_ALIASES)) {
+    const normalizedAliases = aliases.map((value) => normalizeExcelHeaderCell(value));
+    indices[field] = normalizedHeaderRow.findIndex((value) => normalizedAliases.includes(value));
+  }
+  return indices;
+}
+
+function findExcelHeaderRowIndex(rawRows = []) {
+  const scanLimit = Math.min(rawRows.length, 12);
+  for (let rowIndex = 0; rowIndex < scanLimit; rowIndex += 1) {
+    const columns = buildExcelColumnIndexMap(rawRows[rowIndex] ?? []);
+    if (columns.boothCode >= 0 && columns.shopName >= 0) return rowIndex;
+  }
+  return -1;
+}
+
+function getExcelCellText(row = [], index = -1) {
+  if (!Number.isInteger(index) || index < 0) return "";
+  return normalizeSpaces(String(row[index] ?? ""));
+}
+
+function getExcelSheetTitleText(sheet, rawRows = [], headerRowIndex = 0) {
+  const b1 = normalizeSpaces(String(sheet?.B1?.v ?? ""));
+  if (b1) return b1;
+  const titleRows = rawRows.slice(0, Math.max(0, headerRowIndex));
+  return titleRows.flat().map((value) => normalizeSpaces(String(value ?? ""))).filter(Boolean).join(" ");
+}
+
+function hasExcelRowBookingSignals(row = [], columns = {}) {
+  return [columns.phone, columns.note].some((index) =>
+    Number.isInteger(index) && index >= 0 && normalizeSpaces(String(row[index] ?? "")),
+  );
+}
+
 async function handleFileMessage(event) {
   const source = event.source;
   const messageId = event.message?.id;
@@ -5968,6 +6072,65 @@ async function handleFileMessage(event) {
         }
       }
     }
+
+    const parsedExcelRows = [];
+    let firstNormalizedSheetLogged = false;
+    for (const sheetName of workbook.SheetNames) {
+      const sheet = workbook.Sheets[sheetName];
+      const rawRows = XLSX.utils.sheet_to_json(sheet, {
+        header: 1,
+        raw: false,
+        defval: "",
+        blankrows: false,
+      });
+      const headerRowIndex = findExcelHeaderRowIndex(rawRows);
+      if (headerRowIndex < 0) continue;
+
+      const headerRow = rawRows[headerRowIndex] ?? [];
+      const columns = buildExcelColumnIndexMap(headerRow);
+      const titleText = getExcelSheetTitleText(sheet, rawRows, headerRowIndex);
+      let resolved = "";
+      if (titleText.length > 3) resolved = await resolveProjectFromSheetName(titleText, groupId);
+      if (!resolved || resolved === titleText) resolved = await resolveProjectFromSheetName(sheetName, groupId);
+      const projectName = resolved || sheetProjectMap[sheetName] || "";
+      const sheetDates = parseEventString(titleText) ?? sheetDatesMap[sheetName] ?? parseEventString(sheetName);
+
+      console.log(
+        `[file] xlsx:normalized sheet="${sheetName}" title="${titleText.slice(0, 50)}" header_row=${headerRowIndex + 1} -> project="${projectName}" dates=${JSON.stringify(sheetDates)}`,
+      );
+      if (!firstNormalizedSheetLogged) {
+        console.log(`[file] xlsx:normalized columns sheet="${sheetName}" cols=${JSON.stringify(headerRow)}`);
+        const sampleRow = rawRows[headerRowIndex + 1] ?? [];
+        console.log(`[file] xlsx:normalized sample row[0]=${JSON.stringify(sampleRow).slice(0, 200)}`);
+        firstNormalizedSheetLogged = true;
+      }
+
+      let lastShopName = "";
+      for (let rowIndex = headerRowIndex + 1; rowIndex < rawRows.length; rowIndex += 1) {
+        const row = rawRows[rowIndex] ?? [];
+        const boothCode = normalizeBoothCode(getExcelCellText(row, columns.boothCode));
+        const rawShopName = getExcelCellText(row, columns.shopName);
+        const phone = getExcelCellText(row, columns.phone);
+        const note = getExcelCellText(row, columns.note);
+        const hasContinuationSignals = hasExcelRowBookingSignals(row, columns);
+        if (rawShopName) lastShopName = rawShopName;
+        const shopName = rawShopName || (hasContinuationSignals ? lastShopName : "");
+        const isSummaryRow = /^(total|รวม|ผลรวม|สรุป|summary|sub\s*total|grand\s*total|ทั้งหมด)$/i.test(shopName);
+        if (!boothCode || !shopName || isSummaryRow || isImportArtifactShopName(shopName)) continue;
+
+        parsedExcelRows.push({
+          boothCode,
+          shopName,
+          projectName,
+          phone,
+          note,
+          eventStartDate: sheetDates?.startDate ?? null,
+          eventEndDate: sheetDates?.endDate ?? null,
+        });
+      }
+    }
+
+    if (parsedExcelRows.length) excelRows = parsedExcelRows;
   }
 
   if (excelRows.length === 0) {
