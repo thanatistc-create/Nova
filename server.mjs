@@ -39,6 +39,7 @@ const LINE_BOT_SELF_TEST = String(process.env.LINE_BOT_SELF_TEST ?? "").toLowerC
   String(process.env.LINE_BOT_SELF_TEST ?? "").toLowerCase() === "true";
 const LINE_TEXT_AI_MIN_CHARS = Math.max(120, Number(process.env.LINE_TEXT_AI_MIN_CHARS ?? 180) || 180);
 const LINE_TEXT_AI_MAX_CHARS = Math.max(LINE_TEXT_AI_MIN_CHARS, Number(process.env.LINE_TEXT_AI_MAX_CHARS ?? 5000) || 5000);
+const LINE_EXPENSE_ENABLED = String(process.env.LINE_EXPENSE_ENABLED ?? "false").toLowerCase() === "true";
 const LINE_EXPENSE_GROUP_IDS = (process.env.LINE_EXPENSE_GROUP_IDS ?? "")
   .split(",").map(s => s.trim()).filter(Boolean);
 const LINE_TIMEZONE = process.env.LINE_TIMEZONE ?? "Asia/Bangkok";
@@ -1416,6 +1417,10 @@ function normalizeSpaces(value) {
   return (value ?? "").replace(/\s+/g, " ").trim();
 }
 
+function escapeRegExp(value) {
+  return String(value ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function normalizeKey(value) {
   return String(value ?? "")
     .toLowerCase()
@@ -1826,6 +1831,7 @@ function extractAmountFromText(text) {
 }
 
 function looksLikeExpenseText(text) {
+  if (!LINE_EXPENSE_ENABLED) return false;
   const raw = String(text ?? "");
   if (!raw.trim()) return false;
   if (looksLikeBookingText(raw)) return false;
@@ -1839,6 +1845,7 @@ function looksLikeExpenseText(text) {
 }
 
 function mightBeUnrecognizedExpense(text) {
+  if (!LINE_EXPENSE_ENABLED) return false;
   const raw = String(text ?? "");
   if (!raw.trim() || looksLikeExpenseText(raw) || looksLikeBookingText(raw)) return false;
   const hasAmount = extractAmountFromText(raw) !== null;
@@ -1900,6 +1907,131 @@ function parseExpenseCommand(text) {
 
 function hasRequiredExpenseFields(parsed) {
   return Boolean(parsed && Number.isFinite(parsed.amount) && parsed.amount > 0);
+}
+
+function stripFlowaccountUrls(text) {
+  return normalizeSpaces(String(text ?? "").replace(FLOWACCOUNT_URL_REGEX, " "));
+}
+
+function inferProjectFromKnownProjects(text, projectRows = []) {
+  const raw = normalizeSpaces(text);
+  const haystack = normalizeKey(raw);
+  if (!haystack) return "";
+  const matches = (projectRows ?? [])
+    .map((row) => normalizeSpaces(row?.project_name ?? row?.projectName ?? row?.name ?? ""))
+    .filter(Boolean)
+    .filter((name) => {
+      const key = normalizeKey(name);
+      return key.length >= 3 && haystack.includes(key);
+    })
+    .sort((a, b) => normalizeKey(b).length - normalizeKey(a).length);
+  return matches[0] ?? "";
+}
+
+function extractProjectHintFromText(text) {
+  const raw = normalizeSpaces(text);
+  const labels = [
+    "\\u0e07\\u0e32\\u0e19",
+    "\\u0e0a\\u0e37\\u0e48\\u0e2d\\u0e07\\u0e32\\u0e19",
+    "\\u0e42\\u0e1b\\u0e23\\u0e40\\u0e08\\u0e01\\u0e15\\u0e4c",
+    "\\u0e42\\u0e1b\\u0e23\\u0e40\\u0e08\\u0e04",
+    "project",
+    "event",
+  ].join("|");
+  const match = raw.match(new RegExp(`(?:${labels})\\s*[:=]?\\s*(.+)$`, "i"));
+  return normalizeSpaces(match?.[1] ?? "").replace(FLOWACCOUNT_URL_REGEX, "").trim();
+}
+
+function extractShopHintFromText(text, projectName = "") {
+  let raw = stripFlowaccountUrls(text);
+  if (projectName) raw = normalizeSpaces(raw.replace(new RegExp(escapeRegExp(projectName), "i"), " "));
+  const invoiceWord = "\\u0e43\\u0e1a\\u0e41\\u0e08\\u0e49\\u0e07\\u0e2b\\u0e19\\u0e35\\u0e49";
+  const shopLabels = "\\u0e23\\u0e49\\u0e32\\u0e19|shop|vendor|customer";
+  const boothWords = "booth|\\u0e1a\\u0e39\\u0e18|\\u0e1a\\u0e39\\u0e17";
+  const eventWords = "\\u0e07\\u0e32\\u0e19|project|event|\\u0e42\\u0e1b\\u0e23\\u0e40\\u0e08\\u0e01\\u0e15\\u0e4c|\\u0e42\\u0e1b\\u0e23\\u0e40\\u0e08\\u0e04";
+  const labeled = raw.match(new RegExp(`(?:${invoiceWord}\\s*)?(?:${shopLabels})\\s*[:=]?\\s*(.+?)(?=\\s*(?:${boothWords})\\s*[:=]?[A-Za-z0-9-]+|\\s*(?:${eventWords})\\s*[:=]?|$)`, "i"));
+  if (labeled?.[1]) return normalizeSpaces(labeled[1]).slice(0, 160);
+
+  const beforeBooth = raw.match(new RegExp(`^(.+?)\\s*(?:${boothWords})\\s*[:=]?[A-Za-z0-9-]+`, "i"));
+  if (!beforeBooth?.[1]) return "";
+  return normalizeSpaces(
+    beforeBooth[1]
+      .replace(new RegExp(invoiceWord, "ig"), " ")
+      .replace(new RegExp(`(?:${shopLabels})`, "ig"), " "),
+  ).slice(0, 160);
+}
+
+function parseInlineInvoiceBookingText(text, projectRows = [], flowaccountData = null) {
+  const raw = normalizeSpaces(String(text ?? ""));
+  if (!raw || !FLOWACCOUNT_URL_REGEX.test(raw)) return null;
+  const pageText = normalizeSpaces(flowaccountData?.textPreview ?? "");
+  const combined = normalizeSpaces([stripFlowaccountUrls(raw), pageText].filter(Boolean).join(" "));
+  const knownProject = inferProjectFromKnownProjects(combined, projectRows);
+  const projectHint = extractProjectHintFromText(combined);
+  const projectName = normalizeSpaces(knownProject || projectHint);
+  const shopName = extractShopHintFromText(combined, projectName);
+  const boothCode = findBoothFromText(combined);
+  if (!shopName && !projectName && !boothCode) return null;
+  return {
+    projectName,
+    shopName,
+    phone: "",
+    boothCode,
+    productType: "",
+    note: normalizeSpaces(`source=flowaccount_booking | url=${raw.match(FLOWACCOUNT_URL_REGEX)?.[0] ?? ""} | raw=${raw}`).slice(0, 1800),
+  };
+}
+
+async function getActiveProjectRowsForSource(source) {
+  const groupId = getReportGroupIdFromSource(source);
+  if (!groupId) return [];
+  const todayStr = getTimePartsInTz(new Date()).dateStr;
+  const { data, error } = await supabase
+    .from("line_project_pricing")
+    .select("project_name, event_start_date, event_end_date")
+    .eq("group_id", groupId)
+    .gte("event_end_date", todayStr)
+    .order("event_start_date", { ascending: true });
+  if (error) {
+    console.warn("[flowaccount] project lookup failed:", error.message ?? error);
+    return [];
+  }
+  return data ?? [];
+}
+
+async function parseFlowaccountBookingIntent(text, source, flowaccountData = null, lineEvent = null) {
+  const projectRows = await getActiveProjectRowsForSource(source);
+  const structured = parseInlineInvoiceBookingText(text, projectRows, flowaccountData);
+  if (hasRequiredBookingFields(structured)) {
+    return { parsed: structured, sourceTag: "flowaccount_structured" };
+  }
+
+  const shouldAskAi = LINE_AI_TEXT_FALLBACK_ENABLED && FLOWACCOUNT_URL_REGEX.test(text);
+  if (!shouldAskAi) return { parsed: structured, sourceTag: "flowaccount_partial" };
+
+  const activeProjects = projectRows.map((p) => p.project_name).filter(Boolean).join(", ") || "(none)";
+  const enriched = [
+    "FlowAccount invoice/share link was sent to a LINE booth booking bot.",
+    "Decide whether this is a booth booking or an expense. If it has shop/customer, booth, and a matching active project, classify as booking.",
+    `Active projects: ${activeProjects}`,
+    `Message: ${normalizeSpaces(text)}`,
+    flowaccountData?.textPreview ? `FlowAccount page text: ${flowaccountData.textPreview}` : "",
+  ].filter(Boolean).join("\n");
+  const analysis = await callAIForTextParse(enriched, lineEvent);
+  if (inferAiClassification(analysis, enriched) !== "booking") {
+    return { parsed: structured, sourceTag: "flowaccount_partial" };
+  }
+  const aiParsed = buildBookingFromAiAnalysis(analysis, enriched);
+  aiParsed.projectName = normalizeSpaces(
+    inferProjectFromKnownProjects(`${aiParsed.projectName} ${enriched}`, projectRows) ||
+      aiParsed.projectName ||
+      structured?.projectName ||
+      "",
+  );
+  aiParsed.shopName = normalizeSpaces(aiParsed.shopName || structured?.shopName || "");
+  aiParsed.boothCode = normalizeBoothCode(aiParsed.boothCode || structured?.boothCode || "");
+  aiParsed.note = normalizeSpaces(`source=flowaccount_booking_ai | ${aiParsed.note || ""}`).slice(0, 1800);
+  return { parsed: aiParsed, sourceTag: "flowaccount_ai" };
 }
 
 
@@ -2764,6 +2896,10 @@ async function insertExpenseRecord(parsed, source, messageId) {
 }
 
 async function saveExpenseWithProjectPrompt(parsed, source, messageId) {
+  if (!LINE_EXPENSE_ENABLED) {
+    return { ok: false, disabled: true, message: "Expense recording is disabled." };
+  }
+
   const normalized = normalizeParsedExpense(parsed);
 
   if (!hasRequiredExpenseFields(normalized)) {
@@ -2818,6 +2954,8 @@ async function commandConfirmPendingExpenseProject(text, source, messageId) {
 }
 
 async function commandExpense(text, source, messageId, options = {}) {
+  if (!LINE_EXPENSE_ENABLED) return "ปิดระบบบันทึกค่าใช้จ่ายไว้ชั่วคราว";
+
   const parsed = parseExpenseCommand(text);
 
   if (options.sourceTag) {
@@ -2837,6 +2975,7 @@ async function commandExpense(text, source, messageId, options = {}) {
 }
 
 async function commandCancelExpense(source) {
+  if (!LINE_EXPENSE_ENABLED) return "ปิดระบบบันทึกค่าใช้จ่ายไว้ชั่วคราว";
   clearPendingExpense(source);
   return "ตอนนี้ค่าใช้จ่ายจะบันทึกทันทีแล้ว ไม่ต้องรอยืนยันโปรเจกต์";
 }
@@ -3310,6 +3449,7 @@ async function commandSystemStatus(text = "") {
   const hasPeriodColumns = await hasBookingPeriodColumns();
   lines.push(`Booking period schema: ${hasPeriodColumns ? "OK (booking_start_date/booking_end_date)" : "MISSING (fallback uses event_start_date/event_end_date)"}`);
   lines.push(`Digest schedule: ${LINE_IMAGE_SUMMARY_ENABLED ? LINE_IMAGE_SUMMARY_HOURS.join(",") + ":00" : "disabled"}`);
+  lines.push(`Expense recording: ${LINE_EXPENSE_ENABLED ? "enabled" : "disabled"}`);
   lines.push(formatLineHealthStatus());
   lines.push(`Text AI fallback: ${LINE_AI_TEXT_FALLBACK_ENABLED ? `${LINE_AI_PROVIDER || "unknown"} (${LINE_TEXT_AI_MIN_CHARS}-${LINE_TEXT_AI_MAX_CHARS} chars gate)` : "disabled"}`);
   lines.push(`Nova: ${NOVA_ENABLED ? "configured" : "not configured"}`);
@@ -4115,6 +4255,8 @@ async function commandSummary(text, source) {
 
 
 async function commandExpenseSummary(text, source) {
+  if (!LINE_EXPENSE_ENABLED) return "ปิดระบบค่าใช้จ่ายไว้ชั่วคราว";
+
   const groupId = getGroupIdFromSource(source);
   const projectFilter = parseProjectFilter(text);
   const dateStr = parseExportDateFromText(text);
@@ -4164,6 +4306,8 @@ async function commandExpenseSummary(text, source) {
 }
 
 async function commandExportExpenseCsv(text, source) {
+  if (!LINE_EXPENSE_ENABLED) return "ปิดระบบค่าใช้จ่ายไว้ชั่วคราว";
+
   const groupId = getGroupIdFromSource(source);
   const dateStr = parseExportDateFromText(text);
   const projectFilter = parseProjectFilter(text);
@@ -5167,7 +5311,7 @@ async function commandBookingFromImage(event) {
   const source = event.source ?? {};
   const groupId = getGroupIdFromSource(source);
   const messageId = event.message?.id ?? "-";
-  const expenseAllowed = LINE_EXPENSE_GROUP_IDS.length === 0 || LINE_EXPENSE_GROUP_IDS.includes(groupId);
+  const expenseAllowed = LINE_EXPENSE_ENABLED && (LINE_EXPENSE_GROUP_IDS.length === 0 || LINE_EXPENSE_GROUP_IDS.includes(groupId));
   console.log(`[image] pipeline:start message=${messageId} group=${groupId || "-"} expenseAllowed=${expenseAllowed}`);
 
   const imageBuffer = await fetchLineMessageContent(messageId);
@@ -5338,7 +5482,7 @@ async function commandBookingFromImage(event) {
   };
 }
 const FLOWACCOUNT_URL_REGEX =
-  /https?:\/\/(?:app\.)?flowaccount\.com\/(?:share|invoice|document)\/[A-Za-z0-9_\-]+/i;
+  /https?:\/\/(?:(?:app\.)?flowaccount\.com\/(?:share|invoice|document)\/[A-Za-z0-9_\-]+|share\.flowaccount\.com\/[^\s]+)/i;
 
 async function parseFlowaccountHtml(html) {
   try {
@@ -5368,9 +5512,16 @@ async function parseFlowaccountHtml(html) {
       html.match(/(\d{2}\/\d{2}\/\d{4})/);
     const docDate = dateMatch ? dateMatch[1] : null;
 
-    return { amount, vendorName, docNumber, docDate };
+    const textPreview = normalizeSpaces(
+      html
+        .replace(/<script[\s\S]*?<\/script>/gi, " ")
+        .replace(/<style[\s\S]*?<\/style>/gi, " ")
+        .replace(/<[^>]+>/g, " "),
+    ).slice(0, 2500);
+
+    return { amount, vendorName, docNumber, docDate, textPreview };
   } catch {
-    return { amount: null, vendorName: null, docNumber: null, docDate: null };
+    return { amount: null, vendorName: null, docNumber: null, docDate: null, textPreview: "" };
   }
 }
 
@@ -5431,7 +5582,7 @@ async function handleTextMessage(event) {
     const gid = source.groupId ?? source.roomId ?? null;
     if (!gid) return "คำสั่งนี้ใช้ได้เฉพาะใน Group หรือ Room เท่านั้น";
     const inWhitelist = LINE_EXPENSE_GROUP_IDS.length === 0 || LINE_EXPENSE_GROUP_IDS.includes(gid);
-    return `Group ID: ${gid}\nสถานะ expense: ${inWhitelist ? "✅ บันทึกได้" : "🚫 ไม่บันทึก (ไม่อยู่ใน whitelist)"}`;
+    return `Group ID: ${gid}\nสถานะ expense: ${LINE_EXPENSE_ENABLED && inWhitelist ? "✅ บันทึกได้" : "🚫 ปิดการบันทึกไว้"}`;
   }
 
   if (/^\/confirm-replace(?:\s|$)/i.test(normalized) || /^\/ยืนยันแทนที่(?:\s|$)/.test(normalized)) {
@@ -5568,7 +5719,40 @@ async function handleTextMessage(event) {
     const faUrl = rawText.match(FLOWACCOUNT_URL_REGEX)?.[0];
     if (faUrl) {
       const faData = await fetchFlowaccountInvoice(faUrl);
-      if (faData && faData.amount) {
+      const flowBooking = await parseFlowaccountBookingIntent(rawText, source, faData, event);
+      if (hasRequiredBookingFields(flowBooking?.parsed)) {
+        const parsed = flowBooking.parsed;
+        const result = await saveBookingWithAgentRules(parsed, source, event.message?.id);
+        console.log(`[flowaccount] booking saveResult ok=${result.ok} source=${flowBooking.sourceTag} project=${parsed.projectName ?? "-"} shop=${parsed.shopName ?? "-"} booth=${parsed.boothCode ?? "-"}`);
+        if (!result.ok) return result.needsConfirmation ? result.message : null;
+
+        const flowPushTarget = getImageDigestPushTarget(source ?? {});
+        const isDirectChat = !source?.groupId && !source?.roomId;
+        if (flowPushTarget) {
+          queueImageDigestEvent({
+            pushTarget: flowPushTarget,
+            groupId: getGroupIdFromSource(source),
+            sourceType: source?.type ?? "",
+            messageId: event.message?.id ?? null,
+            category: "booking",
+            status: "saved",
+            sourceTag: "flowaccount",
+            reason: flowBooking.sourceTag,
+            projectName: parsed.projectName ?? "",
+            shopName: parsed.shopName ?? "",
+            boothCode: parsed.boothCode ?? "",
+            vendorName: "",
+            amount: null,
+            currency: "THB",
+            detail: "flowaccount invoice link",
+          });
+          startImageDigestScheduler();
+        }
+        if (isDirectChat) return result.message ?? `✅ บันทึกแล้ว: ${parsed.shopName} บูธ ${parsed.boothCode || "-"} (${parsed.projectName})`;
+        return null;
+      }
+
+      if (LINE_EXPENSE_ENABLED && faData && faData.amount) {
         const aiParsed = {
           amount: faData.amount,
           currency: "THB",
@@ -5718,6 +5902,10 @@ async function handleExportCsvRequest(res, reqUrl, type = "daily") {
   }
 
   if (type === "expense") {
+    if (!LINE_EXPENSE_ENABLED) {
+      return jsonResponse(res, 503, { error: "Expense recording is disabled" });
+    }
+
     const dateStr = reqUrl.searchParams.get("date") ?? formatDateInTz(new Date());
     const projectName = normalizeSpaces(reqUrl.searchParams.get("project") ?? "");
 
@@ -5848,7 +6036,7 @@ async function handlePdfMessage(event) {
       });
       startImageDigestScheduler();
     }
-  } else if (classification === "expense") {
+  } else if (classification === "expense" && LINE_EXPENSE_ENABLED) {
     const parsed = buildExpenseFromAiAnalysis(analysis, "");
     if (!hasRequiredExpenseFields(parsed)) return;
     await saveExpenseWithProjectPrompt(parsed, source, messageId);
@@ -6229,6 +6417,13 @@ async function runSelfTests() {
   const parsed = await parseBookingFormText(form, "test-group");
   assertSelfTest(normalizeBoothCode(parsed.boothCode) === "36", "booth code strips price suffix");
   assertSelfTest(parsed.projectName && parsed.shopName, "form parser extracts project and shop");
+
+  const flowText = "ใบแจ้งหนี้ร้านUnmelt Booth8 งานCRAFT&BREW DISTRICT@SIAMPARAPGON https://share.flowaccount.com/bl/th/bqwcfmwvv0iezhaugqtpcw?o=1&p=1";
+  const flowParsed = parseInlineInvoiceBookingText(flowText, [{ project_name: "CRAFT&BREW DISTRICT@SIAMPARAPGON" }]);
+  assertSelfTest(flowParsed?.projectName === "CRAFT&BREW DISTRICT@SIAMPARAPGON", "flowaccount booking extracts known project");
+  assertSelfTest(flowParsed?.shopName === "Unmelt", "flowaccount booking extracts shop");
+  assertSelfTest(flowParsed?.boothCode === "8", "flowaccount booking extracts booth");
+  assertSelfTest(LINE_EXPENSE_ENABLED === false, "expense recording defaults to disabled");
 
   console.log("LINE bot self-tests passed");
 }
